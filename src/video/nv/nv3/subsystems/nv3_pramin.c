@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <86box/86box.h>
+#include <86box/plat_unused.h>
 #include <86box/device.h>
 #include <86box/mem.h>
 #include <86box/pci.h>
@@ -44,14 +45,13 @@ void nv3_debug_ramin_print_context_info(uint32_t name, nv3_ramin_context_t conte
    with the VRAM size alone kept bit 22 of the window's 0xC00000 on 8MB cards (RIVA 128 ZX), so
    the driver's RAMHT went 4MB away from where the chip looked it up. */
 // Read 8-bit ramin
-uint8_t nv3_ramin_read8(uint32_t addr, void* priv)
+uint8_t nv3_ramin_read8(uint32_t addr, UNUSED(void* priv))
 {
     if (!nv3) return 0x00;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    // why does this not work in one line
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10);
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10));
     uint8_t val = nv3->nvbase.svga.vram[ramin_addr];
     
     nv_log_verbose_only("Read word from PRAMIN 0x%08x <- 0x%08x (raw address=0x%08x)\n", ramin_addr, val, addr);
@@ -60,15 +60,14 @@ uint8_t nv3_ramin_read8(uint32_t addr, void* priv)
 }
 
 // Read 16-bit ramin
-uint16_t nv3_ramin_read16(uint32_t addr, void* priv)
+uint16_t nv3_ramin_read16(uint32_t addr, UNUSED(void* priv))
 {
     if (!nv3) return 0x00;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    // why does this not work in one line
     uint16_t* vram_16bit = (uint16_t*)nv3->nvbase.svga.vram;
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10) >> 1;
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10)) >> 1;
 
     uint16_t val = vram_16bit[ramin_addr];
 
@@ -78,15 +77,14 @@ uint16_t nv3_ramin_read16(uint32_t addr, void* priv)
 }
 
 // Read 32-bit ramin
-uint32_t nv3_ramin_read32(uint32_t addr, void* priv)
+uint32_t nv3_ramin_read32(uint32_t addr, UNUSED(void* priv))
 {
     if (!nv3) return 0x00;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    // why does this not work in one line
     uint32_t* vram_32bit = (uint32_t*)nv3->nvbase.svga.vram;
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10) >> 2;
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10)) >> 2;
 
     uint32_t val = vram_32bit[ramin_addr];
     nv_log_verbose_only("Read dword from PRAMIN 0x%08x <- 0x%08x (raw address=0x%08x)\n", ramin_addr, val, addr);
@@ -97,13 +95,13 @@ uint32_t nv3_ramin_read32(uint32_t addr, void* priv)
 // RAMIN write functions 
 
 // Write 8-bit ramin
-void nv3_ramin_write8(uint32_t addr, uint8_t val, void* priv)
+void nv3_ramin_write8(uint32_t addr, uint8_t val, UNUSED(void* priv))
 {
     if (!nv3) return;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10);
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10));
     nv3_watch(ramin_addr, val, 108);
     nv3->nvbase.svga.vram[ramin_addr] = val;
 
@@ -111,17 +109,16 @@ void nv3_ramin_write8(uint32_t addr, uint8_t val, void* priv)
 }
 
 // Write 16-bit ramin
-void nv3_ramin_write16(uint32_t addr, uint16_t val, void* priv)
+void nv3_ramin_write16(uint32_t addr, uint16_t val, UNUSED(void* priv))
 {
     if (!nv3) return;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    // why does this not work in one line
     svga_t* svga = &nv3->nvbase.svga;
     uint16_t* vram_16bit = (uint16_t*)svga->vram;
 
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10) >> 1;
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10)) >> 1;
     nv3_watch(ramin_addr << 1, val, 116);
     vram_16bit[ramin_addr] = val;
 
@@ -129,17 +126,16 @@ void nv3_ramin_write16(uint32_t addr, uint16_t val, void* priv)
 }
 
 // Write 32-bit ramin
-void nv3_ramin_write32(uint32_t addr, uint32_t val, void* priv)
+void nv3_ramin_write32(uint32_t addr, uint32_t val, UNUSED(void* priv))
 {
     if (!nv3) return;
 
     addr &= (NV3_LFB_MAPPING_SIZE - 1) & (nv3->nvbase.svga.vram_max - 1);
 
-    // why does this not work in one line
     svga_t* svga = &nv3->nvbase.svga;
     uint32_t* vram_32bit = (uint32_t*)svga->vram;
 
-    uint32_t ramin_addr = (addr ^ nv3->nvbase.svga.vram_max - 0x10) >> 2;
+    uint32_t ramin_addr = (addr ^ (nv3->nvbase.svga.vram_max - 0x10)) >> 2;
     nv3_watch(ramin_addr << 2, val, 132);
     vram_32bit[ramin_addr] = val;
 
@@ -236,15 +232,14 @@ bool nv3_ramin_find_object(uint32_t name, uint32_t cache_num, uint8_t channel, u
 
     // Perform more validation 
 
+    /* Not errors: PGRAPH uses only the class's low five bits (a software object's class is the
+       resman's business), and the channel is the 7-bit CHID the entry was just matched on --
+       NV3RM uses up to 32 channels (NVRM.H NUM_FIFOS). Both used to be fatal(). */
     if (obj_context_struct.class_id < NV3_PFIFO_FIRST_VALID_GRAPHICS_OBJECT_ID
-    || obj_context_struct.class_id > NV3_PFIFO_LAST_VALID_GRAPHICS_OBJECT_ID)
-    {
-        fatal("NV3: Invalid graphics object class ID name=0x%04x type=%04x, interpreted by pgraph as: %04x (Contact starfrost)", 
-            name, obj_context_struct.class_id, obj_context_struct.class_id & 0x1F);
-    }   
-    else if (obj_context_struct.channel > (NV3_DMA_CHANNELS - 1))
-        fatal("NV3: Super fucked up graphics object. Contact starfrost with the error string: DMA Channel ID=%d, it should be 0-7", obj_context_struct.channel);
-    
+        || obj_context_struct.class_id > NV3_PFIFO_LAST_VALID_GRAPHICS_OBJECT_ID)
+        nv_warning("NV3: object %08x has class %02x outside 0x40-0x5F (PGRAPH sees %02x)\n", name, obj_context_struct.class_id,
+                   obj_context_struct.class_id & 0x1F);
+
     // Illegal accesses sent to RAMRO, so ignore here
     // TODO: SEND THESE TO RAMRO!!!!!
 

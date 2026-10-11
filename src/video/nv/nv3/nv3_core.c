@@ -142,7 +142,7 @@ uint16_t nv3_mmio_read16(uint32_t addr, void* priv)
 }
 
 // Read 32-bit MMIO
-uint32_t nv3_mmio_read32(uint32_t addr, void* priv)
+uint32_t nv3_mmio_read32(uint32_t addr, UNUSED(void* priv))
 {
     uint32_t ret = 0x00;
 
@@ -168,6 +168,28 @@ uint32_t nv3_mmio_read32(uint32_t addr, void* priv)
 
 }
 
+/* A byte or word write goes out as a dword: the other bytes are the register's current value,
+   except in the write-1-to-clear interrupt status registers, where writing back what reads as
+   pending would acknowledge interrupts the driver never touched -- there they are 0 */
+static uint32_t nv3_mmio_partial_base(uint32_t addr)
+{
+    switch (addr & 0xFFFFFC) {
+        case NV3_PMC_INTR:
+        case NV3_PBUS_INTR:
+        case NV3_PFIFO_INTR:
+        case NV3_PRM_INTR:
+        case NV3_PTIMER_INTR:
+        case NV3_PME_INTR:
+        case NV3_PGRAPH_INTR_0:
+        case NV3_PGRAPH_INTR_1:
+        case NV3_PGRAPH_DMA_INTR_0:
+        case NV3_PVIDEO_INTR:
+            return 0;
+        default:
+            return nv3_mmio_read32(addr, NULL);
+    }
+}
+
 // Write 8-bit MMIO
 void nv3_mmio_write8(uint32_t addr, uint8_t val, void* priv)
 {
@@ -187,7 +209,7 @@ void nv3_mmio_write8(uint32_t addr, uint8_t val, void* priv)
     }
     
     // overwrite first 8bits of a 32 bit value
-    uint32_t new_val = nv3_mmio_read32(addr, NULL);
+    uint32_t new_val = nv3_mmio_partial_base(addr);
 
     new_val &= ~(0xFFu << ((addr & 3) << 3));
     new_val |= ((uint32_t) val << ((addr & 3) << 3));
@@ -214,7 +236,7 @@ void nv3_mmio_write16(uint32_t addr, uint16_t val, void* priv)
     }
 
     // overwrite first 16bits of a 32 bit value
-    uint32_t new_val = nv3_mmio_read32(addr, NULL);
+    uint32_t new_val = nv3_mmio_partial_base(addr);
 
     new_val &= ~(0xFFFFu << ((addr & 3) << 3));
     new_val |= ((uint32_t) val << ((addr & 3) << 3));
@@ -223,7 +245,7 @@ void nv3_mmio_write16(uint32_t addr, uint16_t val, void* priv)
 }
 
 // Write 32-bit MMIO
-void nv3_mmio_write32(uint32_t addr, uint32_t val, void* priv)
+void nv3_mmio_write32(uint32_t addr, uint32_t val, UNUSED(void* priv))
 {
     addr &= 0xFFFFFF;
 
@@ -246,7 +268,7 @@ void nv3_mmio_write32(uint32_t addr, uint32_t val, void* priv)
 }
 
 // AGP read function
-uint8_t nv3_agp_read(int32_t func, int32_t addr)
+uint8_t nv3_agp_read(UNUSED(int32_t func), int32_t addr)
 {
     uint8_t ret = 0x00;
 
@@ -255,8 +277,9 @@ uint8_t nv3_agp_read(int32_t func, int32_t addr)
         case NV3_AGP_CAPABILITIES_CAP_ID:
             ret = NV3_AGP_CAPABILITIES_CAP_ID_AGP;     // AGP capable device
             break;
-        case NV3_AGP_CAPABILITIES_NEXT_PTR:             // Always off
-            ret = 0x00; 
+        case NV3_AGP_CAPABILITIES_NEXT_PTR:             // the last capability
+            ret = 0x00;
+            break;
         case NV3_AGP_CAPABILITIES_AGP_VERSION:
             ret = (0x1 << NV3_AGP_CAPABILITIES_AGP_VERSION_MAJOR) | NV3_AGP_CAPABILITIES_AGP_VERSION_MINOR;
             break;
@@ -271,7 +294,7 @@ uint8_t nv3_agp_read(int32_t func, int32_t addr)
             ret = 0x00;             // SBA not supported
             break;
         case NV3_AGP_STATUS_MAX_REQUESTS:
-            ret = NV3_AGP_STATUS_MAX_REQUESTS_AMOUNT;
+            ret = nv3->pbus.agp_rq;
             break;
         // This is also used for SBA but SBA is always off so we can use a bool
         case NV3_AGP_COMMAND_BYTE1:
@@ -289,7 +312,7 @@ uint8_t nv3_agp_read(int32_t func, int32_t addr)
 // BAR0         Pointer to MMIO space
 // BAR1         Pointer to Linear Framebuffer (NV_USER)
 
-uint8_t nv3_pci_read(int32_t func, int32_t addr, UNUSED(int32_t len), void* priv)
+uint8_t nv3_pci_read(int32_t func, int32_t addr, UNUSED(int32_t len), UNUSED(void* priv))
 {
     uint8_t ret = 0x00;
 
@@ -402,8 +425,18 @@ uint8_t nv3_pci_read(int32_t func, int32_t addr, UNUSED(int32_t len), void* priv
             ret = nv3->nvbase.bar1_lfb_base >> 24; //8bit value
             break;
 
+        /* Expansion ROM BAR (NV_CONFIG_PCI_NV_12): ROM_DECODE bit 0, ROM_BASE 31:22 -- a 4 MB
+           window, so a BIOS sizing it with all ones reads back FFC00001. Bits 21:1 read 0: AMI
+           BIOSes size the ROM from this and found none when 0x31/0x32 read back FF (1 short,
+           3 long beeps); Award BIOSes don't size it */
         case NV3_PCI_CFG_ENABLE_VBIOS:
             ret = nv3->nvbase.pci_config.vbios_enabled;
+            break;
+        case NV3_PCI_CFG_ENABLE_VBIOS + 1:
+            ret = 0x00;
+            break;
+        case NV3_PCI_CFG_VBIOS_BASE_L:
+            ret = nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_VBIOS_BASE_L] & 0xC0;
             break;
         
         case NV3_AGP_CAPABILITIES_POINTER:
@@ -434,8 +467,7 @@ uint8_t nv3_pci_read(int32_t func, int32_t addr, UNUSED(int32_t len), void* priv
             ret = 0x00;
             break;
             
-        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_START:
-        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_END:
+        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_START ... NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_END:
             ret = nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID + (addr & 0x03)];
             break;
 
@@ -458,7 +490,7 @@ uint8_t nv3_pci_read(int32_t func, int32_t addr, UNUSED(int32_t len), void* priv
     return ret; 
 }
 
-void nv3_agp_write(int32_t func, int32_t addr, uint8_t val)
+void nv3_agp_write(UNUSED(int32_t func), int32_t addr, uint8_t val)
 {
     nv3->nvbase.pci_config.pci_regs[addr] = val;
 
@@ -472,7 +504,7 @@ void nv3_agp_write(int32_t func, int32_t addr, uint8_t val)
     }
 }
 
-void nv3_pci_write(int32_t func, int32_t addr, UNUSED(int32_t len), uint8_t val, void* priv)
+void nv3_pci_write(int32_t func, int32_t addr, UNUSED(int32_t len), uint8_t val, UNUSED(void* priv))
 {
     // sanity check
     if (!nv3)
@@ -537,7 +569,7 @@ void nv3_pci_write(int32_t func, int32_t addr, UNUSED(int32_t len), uint8_t val,
                     uint32_t old_addr = nv3->nvbase.vbios.mapping.base;
                     // 9bit register
                     uint32_t new_addr = nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_VBIOS_BASE_H] << 24 |
-                    nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_VBIOS_BASE_L] << 16;
+                    (nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_VBIOS_BASE_L] & 0xC0) << 16;
 
                     // move it
                     mem_mapping_set_addr(&nv3->nvbase.vbios.mapping, new_addr, 0x8000);
@@ -565,8 +597,7 @@ void nv3_pci_write(int32_t func, int32_t addr, UNUSED(int32_t len), uint8_t val,
             break;
 
         // these are mirrored to the subsystem id and also stored in the ROMBIOS
-        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_START:
-        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_END:
+        case NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_START ... NV3_PCI_CFG_SUBSYSTEM_ID_MIRROR_END:
             nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID + (addr & 0x03)] = val;
             break;
 
@@ -587,6 +618,15 @@ void nv3_pci_write(int32_t func, int32_t addr, UNUSED(int32_t len), uint8_t val,
 //
 // SVGA functions
 //
+extern uint32_t svga_conv_16to32(svga_t *svga, uint16_t color, uint8_t bpp); /* vid_svga.c */
+
+/* 15/16 bpp through the CLUT as a gamma ramp (PRAMDAC_GENERAL_CONTROL IDC_MODE = gamma) */
+static uint32_t
+nv3_conv_16to32(svga_t *svga, uint16_t color, uint8_t bpp)
+{
+    return svga_lookup_lut_ram(svga, svga_conv_16to32(svga, color, bpp));
+}
+
 void nv3_recalc_timings(svga_t* svga)
 {    
     // sanity check
@@ -603,6 +643,20 @@ void nv3_recalc_timings(svga_t* svga)
        CR2D = bit 8 of htotal (0), display end (1), blank start (2), sync start (3). */
     svga->memaddr_latch += (svga->crtc[NV3_CRTC_REGISTER_RPC0] & 0x1F) << 16;
     svga->rowoffset     += (svga->crtc[NV3_CRTC_REGISTER_RPC0] & 0xE0) << 3;
+    /* PRM 1.4 (CR25, CR1A) and NV3RM's mode set (MODESET.C): CR25 bit 5 = row offset bit 11;
+       CR1A bit 7/6 = hsync/vsync disabled (DPMS standby/suspend/off), bit 0 = VGA address wrap
+       (the CRTC fetches from the first 256 KB only; set by the BIOS for the VGA modes) */
+    if (ext_vert & 0x20)
+        svga->rowoffset += 0x800;
+    /* CR1A bit 2 clear (screens of 1280x1024 and over) enables bit 6 of the horizontal blank end,
+       CR25 bit 4 */
+    if (!(svga->crtc[NV3_CRTC_REGISTER_RPC1] & 0x04)) {
+        svga->hblank_end_val |= (ext_vert & 0x10) << 2;
+        svga->hblank_end_mask = 0x7F;
+    }
+    svga->dpms              = !!(svga->crtc[NV3_CRTC_REGISTER_RPC1] & 0xC0);
+    svga->vram_display_mask = ((pixel_mode == NV3_CRTC_REGISTER_PIXELMODE_VGA) && (svga->crtc[NV3_CRTC_REGISTER_RPC1] & 0x01))
+                            ? (svga->vram_mask & 0x3FFFF) : svga->vram_mask;
 
     if (ext_vert & 0x01)
         svga->vtotal += 0x400;
@@ -652,8 +706,29 @@ void nv3_recalc_timings(svga_t* svga)
             svga->render = svga_render_32bpp_highres;
             break;
         default:
-            /* VGA: everything above is the SVGA core's */
+            /* VGA: everything above is the SVGA core's, but it chose the renderer with the
+               bpp of the last extended mode (Windows' 256-colour shutdown screen came out
+               as 32 bpp after a 32-bit desktop) -- VGA has 8 bits per pixel at most */
+            if (svga->bpp > 8) {
+                svga->bpp = 8;
+                if (!svga->attr_palette_enable || !((svga->gdcreg[6] & 1) || (svga->attrregs[0x10] & 1))
+                    || ((svga->gdcreg[5] & 0x60) < 0x40))
+                    break; /* blanked, text, or 16/4 colours: the core got those right */
+                svga->map8   = svga->pallook;
+                svga->render = svga->lowres ? svga_render_8bpp_lowres : svga_render_8bpp_highres;
+            }
             break;
+    }
+
+    /* Direct colour modes go through the CLUT as a per-channel gamma ramp unless
+       PRAMDAC_GENERAL_CONTROL IDC_MODE selects index (nv3_ref.h: reset value gamma). NV3RM sets
+       index at 8 bpp and gamma at 16/32 bpp after loading the CLUT with an identity ramp
+       (vid_mode.c, dacmode.c dacLoadIdentityDAC), so apps' gamma ramps take effect. */
+    {
+        bool gamma = (pixel_mode >= NV3_CRTC_REGISTER_PIXELMODE_16BPP)
+                  && !((nv3->pramdac.general_control >> NV3_PRAMDAC_GENERAL_CONTROL_IDC_MODE) & 1);
+        svga->lut_map     = gamma;
+        svga->conv_16to32 = gamma ? nv3_conv_16to32 : svga_conv_16to32;
     }
 
     /* Hardware cursor: CR31 bit 0 shows it; the image is 32x32 A1R5G5B5 in instance memory */
@@ -677,7 +752,7 @@ void nv3_recalc_timings(svga_t* svga)
     }
 }
 
-void nv3_speed_changed(void* priv)
+void nv3_speed_changed(UNUSED(void* priv))
 {
     // sanity check
     if (!nv3)
@@ -688,7 +763,7 @@ void nv3_speed_changed(void* priv)
 
 // Force Redraw
 // Reset etc.
-void nv3_force_redraw(void* priv)
+void nv3_force_redraw(UNUSED(void* priv))
 {
     // sanity check
     if (!nv3)
@@ -765,7 +840,7 @@ uint8_t nv3_svga_read(uint16_t addr, void* priv)
 }
 
 // Write to SVGA core memory
-void nv3_svga_write(uint16_t addr, uint8_t val, void* priv)
+void nv3_svga_write(uint16_t addr, uint8_t val, UNUSED(void* priv))
 {
     // sanity check
     if (!nv3)
@@ -879,19 +954,19 @@ void nv3_svga_write(uint16_t addr, uint8_t val, void* priv)
 }
 
 /* DFB, sets up a dumb framebuffer */
-uint8_t nv3_dfb_read8(uint32_t addr, void* priv)
+uint8_t nv3_dfb_read8(uint32_t addr, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     return nv3->nvbase.svga.vram[addr];
 }
 
-uint16_t nv3_dfb_read16(uint32_t addr, void* priv)
+uint16_t nv3_dfb_read16(uint32_t addr, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     return (nv3->nvbase.svga.vram[addr + 1] << 8) | nv3->nvbase.svga.vram[addr];
 }
 
-uint32_t nv3_dfb_read32(uint32_t addr, void* priv)
+uint32_t nv3_dfb_read32(uint32_t addr, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     return (nv3->nvbase.svga.vram[addr + 3] << 24) | (nv3->nvbase.svga.vram[addr + 2] << 16) |
@@ -910,7 +985,7 @@ void nv3_watch(uint32_t addr, uint32_t val, int size)
     }
 }
 
-void nv3_dfb_write8(uint32_t addr, uint8_t val, void* priv)
+void nv3_dfb_write8(uint32_t addr, uint8_t val, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     nv3_watch(addr, val, 8);
@@ -918,7 +993,7 @@ void nv3_dfb_write8(uint32_t addr, uint8_t val, void* priv)
     nv3->nvbase.svga.changedvram[addr >> 12] = changeframecount;
 }
 
-void nv3_dfb_write16(uint32_t addr, uint16_t val, void* priv)
+void nv3_dfb_write16(uint32_t addr, uint16_t val, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     nv3_watch(addr, val, 16);
@@ -927,7 +1002,7 @@ void nv3_dfb_write16(uint32_t addr, uint16_t val, void* priv)
     nv3->nvbase.svga.changedvram[addr >> 12] = changeframecount;
 }
 
-void nv3_dfb_write32(uint32_t addr, uint32_t val, void* priv)
+void nv3_dfb_write32(uint32_t addr, uint32_t val, UNUSED(void* priv))
 {
     addr &= (nv3->nvbase.svga.vram_mask);
     nv3_watch(addr, val, 32);
@@ -972,35 +1047,23 @@ void nv3_draw_cursor(svga_t* svga, int32_t drawline)
     svga->hwcursor_latch.addr += NV3_PRAMDAC_CURSOR_SIZE_X * 2;
 }
 
-// MMIO 0x110000->0x111FFF is mapped to a mirror of the VBIOS.
-// Note this area is 64kb and the vbios is only 32kb. See below..
-
-uint8_t nv3_prom_read(uint32_t address)
+/* A dword of the VBIOS through the PROM window (0x110000-0x11FFFF, 64 KB; the image is 32 KB):
+   the arbiter hands over the dword-aligned address and nv3_mmio_read8/16 pick the bytes out, so
+   all four come back (only one used to, and the offset was kept in a uint8_t: the first 256 bytes,
+   repeated). Past the end of the image the window reads 0xFF. */
+uint32_t nv3_prom_read(uint32_t address)
 {
-    // prom area is 64k, so...
-    // first see if we even have a rom of 64kb in size
-    uint32_t max_rom_size = NV3_PROM_END - NV3_PROM_START;
-    uint32_t real_rom_size = max_rom_size;
+    uint32_t offset = (address - NV3_PROM_START) & ~3u;
+    uint32_t size   = (uint32_t) nv3->nvbase.vbios.sz;
+    uint32_t ret    = 0;
 
-    // set it
-    if (nv3->nvbase.vbios.sz < max_rom_size)
-        real_rom_size = nv3->nvbase.vbios.sz;
-
-    //get our real address
-    uint8_t rom_address = address & max_rom_size;
-
-    // Does this mirror on real hardware?
-    if (rom_address >= real_rom_size)
-    {
-        nv_log("PROM VBIOS Read to INVALID address 0x%05x, returning 0xFF", rom_address);
-        return 0xFF;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint8_t val = 0xFF;
+        if (nv3->nvbase.vbios.rom && (offset + i < size))
+            val = nv3->nvbase.vbios.rom[offset + i];
+        ret |= (uint32_t) val << (i * 8);
     }
-    else
-    {
-        uint8_t val = nv3->nvbase.vbios.rom[rom_address];
-        nv_log("PROM VBIOS Read 0x%05x <- 0x%05x", val, rom_address);
-        return val;
-    }
+    return ret;
 }
 
 void nv3_prom_write(uint32_t address, uint32_t value)
@@ -1217,6 +1280,14 @@ static void nv3_debug_hook(const char *args)
                svga->crtc[0], svga->crtc[1], svga->crtc[2], svga->crtc[3], svga->crtc[4], svga->crtc[5], svga->crtc[6], svga->crtc[7],
                svga->crtc[0x25], svga->crtc[0x2d], svga->crtc[0x30], svga->crtc[0x31],
                svga->seqregs[1], svga->gdcreg[6], svga->attrregs[0x10], svga->miscout);
+    always_log("nv3: straps %03x pfb boot %08x subsystem %02x%02x:%02x%02x ptimer %016llx num %u den %u\n", nv3->straps,
+               nv3_pfb_read(NV3_PFB_BOOT), nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID + 1],
+               nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID], nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID + 3],
+               nv3->nvbase.pci_config.pci_regs[NV3_PCI_CFG_SUBSYSTEM_ID + 2], (unsigned long long) nv3->ptimer.time,
+               nv3->ptimer.clock_numerator, nv3->ptimer.clock_denominator);
+    always_log("nv3: hdisp %d htotal %d hblankstart %d hblank_end %02x/%02x sub %d x_add %d left %d mon_overscan_x %d CR1A %02x CR03 %02x CR05 %02x\n",
+               svga->hdisp, svga->htotal, svga->hblankstart, svga->hblank_end_val, svga->hblank_end_mask, svga->hblank_sub,
+               svga->x_add, svga->left_overscan, svga->monitor->mon_overscan_x, svga->crtc[0x1a], svga->crtc[3], svga->crtc[5]);
     always_log("nv3: dac mask %02x ramdac %d | pal 0 %06x 1 %06x 7 %06x 15 %06x 255 %06x | user_dac mask %02x\n",
                svga->dac_mask, svga->ramdac_type, svga->pallook[0] & 0xffffff, svga->pallook[1] & 0xffffff,
                svga->pallook[7] & 0xffffff, svga->pallook[15] & 0xffffff, svga->pallook[255] & 0xffffff,
@@ -1232,6 +1303,11 @@ static void nv3_debug_hook(const char *args)
                    (line > 0) ? pclk / line / 1000.0 : 0.0, (line > 0 && svga->vtotal) ? pclk / line / svga->vtotal : 0.0,
                    svga->clock);
     }
+    always_log("nv3: pvideo control %08x key %08x point %08x size %08x scale %08x start %06x/%06x pitch %x/%x | overlay ena %d %d,%d %dx%d bpp %d\n",
+               nv3->pvideo.regs[0x44 >> 2], nv3->pvideo.regs[0x40 >> 2], nv3->pvideo.regs[0x30 >> 2], nv3->pvideo.regs[0x34 >> 2],
+               nv3->pvideo.regs[0x00 >> 2], nv3->pvideo.regs[0x0C >> 2], nv3->pvideo.regs[0x10 >> 2], nv3->pvideo.regs[0x14 >> 2],
+               nv3->pvideo.regs[0x18 >> 2], svga->overlay.ena, svga->overlay.x, svga->overlay.y, svga->overlay.cur_xsize,
+               svga->overlay.cur_ysize, svga->bpp);
     for (int b = 0; b < NV3_PGRAPH_MAX_BUFFERS; b++)
         always_log("nv3: buffer %d offset %06x pitch %d bpixel %08x\n", b, nv3->pgraph.boffset[b], nv3->pgraph.bpitch[b], nv3->pgraph.bpixel[b]);
     always_log("nv3: dst canvas %08x-%08x uclip %d,%d-%d,%d cliprect ctrl %x | rop %02x beta %08x chroma %08x pattern shape %d rgb %08x/%08x a %02x/%02x bits %08x%08x | ctx %08x debug0 %08x\n",
@@ -1375,7 +1451,7 @@ static void nv3_debug_hook(const char *args)
 }
 #endif
 
-void* nv3_init(const device_t *info)
+void* nv3_init(UNUSED(const device_t *info))
 {
     // set the vram amount and gpu revision
     
@@ -1482,6 +1558,7 @@ void* nv3_init(const device_t *info)
     nv3_pfb_init();                 // Initialise Framebuffer Interface
     nv3_pramdac_init();             // Initialise RAMDAC (CLUT, final pixel presentation etc)
     nv3_pgraph_init();              // Initialise accelerated graphics engine
+    nv3_pvideo_init();              // Initialise video overlay
     timer_add(&nv3->dma_pusher_timer, nv3_pfifo_dma_pusher_timer, NULL, 0);
 
     nv_log("Initialising I2C...");
@@ -1546,7 +1623,7 @@ void* nv3t_init_agp(const device_t* info)
    driver was loaded, and Windows 2000 stalled at its boot screen. VRAM, the
    VBIOS, the SVGA core and the PCI configuration are left alone -- the BIOS
    enumerates the card and runs its VBIOS again after the reset. */
-static void nv3_reset(void* priv)
+static void nv3_reset(UNUSED(void* priv))
 {
     timer_disable(&nv3->dma_pusher_timer);
 
@@ -1560,6 +1637,7 @@ static void nv3_reset(void* priv)
     memset(&nv3->ramfc, 0, sizeof(nv3->ramfc));
     memset(&nv3->pvideo, 0, sizeof(nv3->pvideo));
     memset(&nv3->pme, 0, sizeof(nv3->pme));
+    memset(nv3->prim_saved, 0, sizeof(nv3->prim_saved));
     nv3->nvbase.cio_read_bank = nv3->nvbase.cio_write_bank = 0;
 
     nv3_pstraps_init();
@@ -1567,11 +1645,12 @@ static void nv3_reset(void* priv)
     nv3_pfb_init();
     nv3_pramdac_init();
     nv3_pgraph_init();
+    nv3_pvideo_init();
 
     nv3_pmc_clear_interrupts();
 }
 
-void nv3_close(void* priv)
+void nv3_close(UNUSED(void* priv))
 {
 #ifdef USE_DEBUG_CMD
     debug_cmd_set_device_hook(NULL);
