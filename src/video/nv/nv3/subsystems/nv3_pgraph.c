@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <86box/86box.h>
+#include <86box/plat_unused.h>
 #include <86box/device.h>
 #include <86box/mem.h>
 #include <86box/pci.h>
@@ -44,8 +45,7 @@ uint32_t nv3_pgraph_read(uint32_t address)
 { 
     // before doing anything, check that this is even enabled..
 
-    if (!(nv3->pmc.enable >> NV3_PMC_ENABLE_PGRAPH)
-    & NV3_PMC_ENABLE_PGRAPH_ENABLED)
+    if (!((nv3->pmc.enable >> NV3_PMC_ENABLE_PGRAPH) & NV3_PMC_ENABLE_PGRAPH_ENABLED))
     {
         nv_log("Repressing PGRAPH read. The subsystem is disabled according to pmc_enable, returning 0\n");
         return 0x00;
@@ -177,6 +177,9 @@ uint32_t nv3_pgraph_read(uint32_t address)
         case NV3_PGRAPH_D3D_CONFIG:
             ret = nv3->pgraph.d3d_config;
             break;
+        case NV3_PGRAPH_ALPHACNTRL:
+            ret = nv3->pgraph.d3d_alpha;
+            break;
         // DMA
         case NV3_PGRAPH_DMA:
             ret = nv3->pgraph.dma_settings;
@@ -223,6 +226,14 @@ uint32_t nv3_pgraph_read(uint32_t address)
         case NV3_PGRAPH_TRAPPED_INSTANCE:
             ret = nv3->pgraph.trapped_instance;
             break;
+        /* The rest -- among them what NV3RM's channel switch (GRCTXT.C grUnloadCurrentPatch /
+           grLoadPatch) saves and restores: SOURCE_COLOR, MONO_COLOR0, MISC24_0/1, PASSTHRU, the
+           D3D_* vertex registers, XY_LOGIC_MISC*, X/Y_MISC, ABS_ICLIP, CLIPX/Y, ABS_UCLIPA, the
+           ABS_X/Y and ZFOG RAMs, EXCEPTIONS -- read back what was written */
+        default:
+            if (address <= NV3_PGRAPH_REGISTER_END)
+                ret = nv3->pgraph.regs[(address & 0x1FFF) >> 2];
+            break;
     }
 
     /* Special exception for memory areas */
@@ -240,8 +251,7 @@ uint32_t nv3_pgraph_read(uint32_t address)
 
 void nv3_pgraph_write(uint32_t address, uint32_t value) 
 {
-    if (!(nv3->pmc.enable >> NV3_PMC_ENABLE_PGRAPH)
-    & NV3_PMC_ENABLE_PGRAPH_ENABLED)
+    if (!((nv3->pmc.enable >> NV3_PMC_ENABLE_PGRAPH) & NV3_PMC_ENABLE_PGRAPH_ENABLED))
     {
         nv_log("Repressing PGRAPH write. The subsystem is disabled according to pmc_enable\n");
         return;
@@ -303,8 +313,20 @@ void nv3_pgraph_write(uint32_t address, uint32_t value)
             *(uint32_t*)&nv3->pgraph.context_control = value;
             break;
         case NV3_PGRAPH_CONTEXT_USER:
+        {
+            /* the resman loading another channel's context: its primitive state comes with it
+               (on the chip the resman saves and reloads those registers itself) */
+            uint32_t old_chid = (nv3->pgraph.context_user >> NV3_PGRAPH_CONTEXT_USER_CHANNEL) & 0x7F;
+            uint32_t new_chid = (value >> NV3_PGRAPH_CONTEXT_USER_CHANNEL) & 0x7F;
+
+            if (old_chid != new_chid) {
+                nv3->prim_saved[old_chid]          = nv3->pgraph.prim;
+                nv3->pgraph.prim                   = nv3->prim_saved[new_chid];
+                nv3->pgraph.prim.d3d.tex_mapped    = false; /* page lookups go through the channel's DMA objects */
+            }
             nv3->pgraph.context_user = value;
             break;
+        }
         // Clip (18-bit signed)
         case NV3_PGRAPH_ABS_UCLIP_XMIN:
             nv3->pgraph.uclip_min[0] = ((int32_t) (value << 14)) >> 14;
@@ -380,6 +402,9 @@ void nv3_pgraph_write(uint32_t address, uint32_t value)
         case NV3_PGRAPH_D3D_CONFIG:
             nv3->pgraph.d3d_config = value;
             break;
+        case NV3_PGRAPH_ALPHACNTRL:
+            nv3->pgraph.d3d_alpha = value & 0xFFF;
+            break;
         // DMA
         case NV3_PGRAPH_DMA:
             nv3->pgraph.dma_settings = value & 0xFFFF;
@@ -432,6 +457,10 @@ void nv3_pgraph_write(uint32_t address, uint32_t value)
             break;
         case NV3_PGRAPH_TRAPPED_INSTANCE:
             nv3->pgraph.trapped_instance = value;
+            break;
+        default:
+            if (address <= NV3_PGRAPH_REGISTER_END)
+                nv3->pgraph.regs[(address & 0x1FFF) >> 2] = value;
             break;
     }
 
@@ -530,7 +559,7 @@ void nv3_pgraph_interrupt_invalid(uint32_t num)
 }
 
 // VBlank. Fired every single frame.
-void nv3_pgraph_vblank_start(svga_t* svga)
+void nv3_pgraph_vblank_start(UNUSED(svga_t* svga))
 {
     nv3_pgraph_interrupt_valid(NV3_PGRAPH_INTR_0_VBLANK);
     nv3_pvideo_vblank();
@@ -689,7 +718,10 @@ void nv3_pgraph_submit(uint32_t param, uint16_t method, uint8_t channel, uint8_t
                 nv3_class_01c_method(param, method, context, grobj);
                 break;             
             default:
-                fatal("NV3 (nv3_pgraph_submit): Attempted to execute method on invalid, or unimplemented, class ID %s", nv3_class_names[class_id]);
+                /* a class with no hardware here: hand the method to the driver as a software method,
+                   as the class handlers do with methods they don't know (this used to be fatal()) */
+                nv_warning("NV3: method %04x on unimplemented class %02x (%s)\n", method, class_id, nv3_class_names[class_id & 0x1F]);
+                nv3_pgraph_interrupt_invalid(NV3_PGRAPH_INTR_1_SOFTWARE_METHOD_PENDING);
                 return;
         }
     }

@@ -1,7 +1,6 @@
-# The NVIDIA RIVA 128 (NV3) in 86Box
+# The NVIDIA RIVA 128 (NV3) in 86Box-Next
 
-This document explains how 86Box emulates the NVIDIA RIVA 128 (developed in
-[86Box-Next](https://github.com/Xeon3D/86Box-Next)), what works, how the pieces
+This document explains how 86Box-Next emulates the NVIDIA RIVA 128, what works, how the pieces
 fit together, and how it was made to work with NVIDIA's own Windows 98 drivers. It is written
 for people: someone who wants to use the card, someone who wants to understand the code, or
 someone who picks the work up later. File names are relative to the repository root.
@@ -377,7 +376,7 @@ All on Windows 98 SE, a Pentium 233 MMX, with NVIDIA's 4.11.01.0337 driver:
 | 3DMark 99 MAX, default benchmark | runs through, ~1465 3DMarks |
 | 3DMark 99 Race, First Person, fill rate, texture, filtering, polygon tests | render correctly |
 | OpenGL screensavers (5) | render on the card (16 bpp); software fallback at 32 bpp |
-| DirectDraw overlay (YUY2, scaled, 1:1, colour-keyed) | correct (test program in 86Box-Next's `tools/nv3/ovltest`) |
+| DirectDraw overlay (YUY2, scaled, 1:1, colour-keyed) | correct (test program in `tools/nv3/ovltest`) |
 | 2 MB configuration | boots, DirectDraw tests pass |
 
 The RIVA 128 ZX (8 MB) on Windows 98 SE: desktop at 640x480 and 1024x768 (8/16 bpp), dxdiag
@@ -406,9 +405,6 @@ DirectDraw tests.
 
 ## 13. Debugging and test tools
 
-The tools below live in [86Box-Next](https://github.com/Xeon3D/86Box-Next), where the card was developed; in 86Box
-the state dump in `nv3_core.c` is only built with `USE_DEBUG_CMD`.
-
 - **`dev nv3 ...`** (through 86Box-Next's debug command file, `BOX86NEXT_DEBUG_CMD`): a state
   dump; traces of MMIO accesses, FIFO software methods and RAMHT binds, M2MF transfers,
   notifiers, push buffer headers, Direct3D triangles, texture mip levels; the last 256
@@ -419,7 +415,7 @@ the state dump in `nv3_core.c` is only built with `USE_DEBUG_CMD`.
   change resolution, run dxdiag, 3DMark, the OpenGL screensavers, the overlay test), helpers
   to disassemble the drivers, and `ovltest`, a small DirectDraw overlay test program for
   Windows 98.
-- `handoffnvidia.md` at 86Box-Next's repository root is the working log: state, rules, open items.
+- `handoffnvidia.md` at the repository root is the working log: state, rules, open items.
 
 ## 14. The bugs that mattered
 

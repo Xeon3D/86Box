@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <86box/86box.h>
+#include <86box/plat_unused.h>
 #include <86box/device.h>
 #include <86box/dma.h>
 #include <86box/mem.h>
@@ -214,8 +215,8 @@ bool nv3_perform_dma_m2mf(nv3_grobj_t grobj)
         int      fault = 0;
 
         if (lines && len) {
-            uint32_t last_in  = offset_in + (lines - 1) * nv3->pgraph.m2mf.pitch_in + (len - 1);
-            uint32_t last_out = offset_out + (lines - 1) * nv3->pgraph.m2mf.pitch_out + ((len - 1) / inc_in) * inc_out;
+            uint32_t last_in  = offset_in + (lines - 1) * nv3->pgraph.m2mf.pitch_in + (len - 1) * inc_in;
+            uint32_t last_out = offset_out + (lines - 1) * nv3->pgraph.m2mf.pitch_out + (len - 1) * inc_out;
 
             if (in_inst != NV3_M2MF_VRAM)
                 fault = nv3_dma_check(in_inst, offset_in, last_in, false);
@@ -234,12 +235,16 @@ bool nv3_perform_dma_m2mf(nv3_grobj_t grobj)
         }
     }
 
+    /* LINE_LENGTH_IN counts the bytes moved, not the span read: the Win9x DirectDraw driver's
+       YV12 -> YUY2 conversion copies a 640-byte YUY2 row's 320 chroma bytes to the next row
+       with length 320, input and output increment 2 (NV3DD32 dvideo32.c) */
     for (uint32_t line = 0; line < nv3->pgraph.m2mf.num_scanlines; line++) {
         uint32_t in  = offset_in;
         uint32_t out = offset_out;
 
-        for (uint32_t i = 0; i < nv3->pgraph.m2mf.scanline_length; i += inc_in) {
-            nv3_m2mf_write8(out_inst, out, nv3_m2mf_read8(in_inst, in + i));
+        for (uint32_t i = 0; i < nv3->pgraph.m2mf.scanline_length; i++) {
+            nv3_m2mf_write8(out_inst, out, nv3_m2mf_read8(in_inst, in));
+            in += inc_in;
             out += inc_out;
         }
         offset_in += nv3->pgraph.m2mf.pitch_in;
@@ -250,7 +255,7 @@ bool nv3_perform_dma_m2mf(nv3_grobj_t grobj)
 
 /* Write an NvNotification (16 bytes: the time in ns, info32, info16 and the
    status) at notifier index `index` of the object's notifier DMA object */
-void nv3_write_notifier(nv3_grobj_t grobj, uint32_t index, uint16_t status, uint32_t info32, uint16_t info16)
+void nv3_write_notifier(UNUSED(nv3_grobj_t grobj), uint32_t index, uint16_t status, uint32_t info32, uint16_t info16)
 {
     uint32_t inst = nv3->pgraph.notifier & 0xFFFF;
     uint32_t off  = index << 4;
@@ -273,7 +278,7 @@ void nv3_write_notifier(nv3_grobj_t grobj, uint32_t index, uint16_t status, uint
 
 /* After a method: if a notify was armed (NOTIFY method), write the
    notifier and disarm it (NOTIFY register bit 16). */
-void nv3_notify_if_needed(uint32_t name, uint32_t method_id, nv3_ramin_context_t context, nv3_grobj_t grobj)
+void nv3_notify_if_needed(UNUSED(uint32_t name), uint32_t method_id, UNUSED(nv3_ramin_context_t context), nv3_grobj_t grobj)
 {
     if (!nv3->pgraph.notify_pending)
         return;
