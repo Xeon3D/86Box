@@ -125,7 +125,6 @@ video_cards[] = {
     { .device = &inmos_isa_device,                              .flags = VIDEO_FLAG_TYPE_XGA       },
     { .device = &jvga_device,                                   .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &paradise_wd90c31_device,                       .flags = VIDEO_FLAG_TYPE_NONE      },
-    { .device = &paradise_speedstar24x_device,                  .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_86c911_isa_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_86c924_isa_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
     { .device = &s3_86c928_isa_device,                          .flags = VIDEO_FLAG_TYPE_NONE      },
@@ -571,6 +570,10 @@ video_voodoo_init(void)
     /* Enable the Voodoo if configured. */
     if (voodoo_enabled)
         device_add(&voodoo_device);
+
+    /* Enable the PowerVR PCX1/PCX2 if configured. */
+    if (powervr_enabled)
+        device_add(&powervr_pcx_device);
 }
 
 int
