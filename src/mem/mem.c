@@ -131,6 +131,10 @@ mem_mapping_t        *write_mapping[MEM_MAPPINGS_NO];
 
 uint8_t              *_mem_exec[MEM_MAPPINGS_NO];
 
+/* Moves on whenever the map is rebuilt: a pointer mem_phys_ptr gave holds
+   while it is unchanged. */
+uint32_t mem_mapping_gen;
+
 static mem_mapping_t *base_mapping;
 static mem_mapping_t *last_mapping;
 static mem_mapping_t *read_mapping_bus[MEM_MAPPINGS_NO];
@@ -141,6 +145,13 @@ static mem_state_t    _mem_state[MEM_MAPPINGS_NO];
 static uint32_t       remap_start_addr;
 static uint32_t       remap_start_addr2;
 static size_t         ram_size = 0;
+
+/* The bytes of guest RAM behind ram[]. */
+size_t
+mem_ram_size(void)
+{
+    return ram_size;
+}
 
 #ifdef ENABLE_MEM_LOG
 int mem_do_log = ENABLE_MEM_LOG;
@@ -271,14 +282,20 @@ flushmmucache_nopc(void)
 }
 
 void
-mem_flush_write_page(uint32_t addr, uint32_t virt)
+mem_flush_write_page(uint32_t addr, UNUSED(uint32_t virt))
 {
     const page_t *page_target = &pages[addr >> 12];
+    /* Where the page is stored, if not at ram[addr] (remapped RAM). */
+    const uint8_t *mem        = ((page_target->mem != NULL) && (page_target->mem != page_ff)) ? page_target->mem : NULL;
 
     for (uint16_t c = 0; c < 256; c++) {
         if (writelookup[c] != (int) 0xffffffff) {
-            uintptr_t target = (uintptr_t) &ram[(uintptr_t) (addr & ~0xfff) - (virt & ~0xfff)];
-            if (writelookup2[writelookup[c]] == target || page_lookup[writelookup[c]] == page_target) {
+            /* Match every virtual alias of the physical page, not only the
+               one being compiled, as each holds its own RAM offset. */
+            uintptr_t virt_page = (uintptr_t) (uint32_t) writelookup[c] << 12;
+            uintptr_t target    = (uintptr_t) &ram[(uintptr_t) (addr & ~0xfff) - virt_page];
+            if ((writelookup2[writelookup[c]] == target) || ((mem != NULL) && (writelookup2[writelookup[c]] == ((uintptr_t) mem - virt_page))) ||
+                (page_lookup[writelookup[c]] == page_target)) {
                 writelookup2[writelookup[c]] = LOOKUP_INV;
                 page_lookup[writelookup[c]]  = NULL;
                 writelookup[c]               = 0xffffffff;
@@ -660,6 +677,15 @@ addreadlookup(uint32_t virt, uint32_t phys)
 void
 addwritelookup(uint32_t virt, uint32_t phys)
 {
+    addwritelookup_remapped(virt, phys, phys);
+}
+
+/* For RAM the processor sees at bus address phys but which is stored at
+   ram[ram_addr]: code is tracked by bus address, so phys picks the page the
+   check for code is made on, and ram_addr where the writes go. */
+void
+addwritelookup_remapped(uint32_t virt, uint32_t phys, uint32_t ram_addr)
+{
     /* As in addreadlookup(). The RAM write handlers mark code pages dirty
        themselves, so page_lookup is not needed for that meanwhile. */
     if ((virt == 0xffffffff) || cpu_dr_armed)
@@ -687,7 +713,7 @@ addwritelookup(uint32_t virt, uint32_t phys)
 #endif
         page_lookup[virt >> 12]  = &pages[phys >> 12];
     } else
-        writelookup2[virt >> 12] = (uintptr_t) &ram[(uintptr_t) (phys & ~0xFFF) - (uintptr_t) (virt & ~0xfff)];
+        writelookup2[virt >> 12] = (uintptr_t) &ram[(uintptr_t) (ram_addr & ~0xFFF) - (uintptr_t) (virt & ~0xfff)];
 
     writelookup[writelnext++] = virt >> 12;
     writelnext &= (cachesize - 1);
@@ -1705,6 +1731,24 @@ do_mmutranslate(uint32_t addr, uint32_t *a64, int num, int write)
     }
 }
 
+/* Where the len bytes at addr are, as the processor would read them, when
+   they lie in one granule of plain memory (RAM or ROM behind no handler);
+   NULL otherwise, for the caller to read them one at a time. */
+const uint8_t *
+mem_phys_ptr(uint32_t addr, uint32_t len)
+{
+    const mem_mapping_t *map = read_mapping_bus[addr >> MEM_GRANULARITY_BITS];
+    uint32_t             off;
+
+    if (!len || (len > MEM_GRANULARITY_SIZE) || !cpu_use_exec || (map == NULL) || (map->exec == NULL) ||
+        (((addr & MEM_GRANULARITY_MASK) + len) > MEM_GRANULARITY_SIZE))
+        return NULL;
+    off = (addr - map->base) & map->mask;
+    if ((((addr + len - 1) - map->base) & map->mask) != (off + len - 1))
+        return NULL; /* a small mirrored mapping wraps inside the granule */
+    return &map->exec[off];
+}
+
 uint8_t
 mem_readb_phys(uint32_t addr)
 {
@@ -1820,6 +1864,8 @@ mem_read_phys_block(void *dest, uint32_t addr, uint32_t len)
     return done;
 }
 
+static void mem_phys_written(uint32_t addr, uint32_t len);
+
 void
 mem_writeb_phys(uint32_t addr, uint8_t val)
 {
@@ -1832,6 +1878,7 @@ mem_writeb_phys(uint32_t addr, uint8_t val)
             map->exec[(addr - map->base) & map->mask] = val;
         else if (map->write_b)
             map->write_b(addr, val, map->priv);
+        mem_phys_written(addr, 1);
     }
 }
 
@@ -1846,9 +1893,11 @@ mem_writew_phys(uint32_t addr, uint16_t val)
     if (cpu_use_exec && ((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_HBOUND) && (map && map->exec)) {
         p  = (uint16_t *) &(map->exec[(addr - map->base) & map->mask]);
         *p = val;
-    } else if (((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_HBOUND) && (map && map->write_w))
+        mem_phys_written(addr, 2);
+    } else if (((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_HBOUND) && (map && map->write_w)) {
         map->write_w(addr, val, map->priv);
-    else {
+        mem_phys_written(addr, 2);
+    } else {
         mem_writeb_phys(addr, val & 0xff);
         mem_writeb_phys(addr + 1, (val >> 8) & 0xff);
     }
@@ -1865,9 +1914,11 @@ mem_writel_phys(uint32_t addr, uint32_t val)
     if (cpu_use_exec && ((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_QBOUND) && (map && map->exec)) {
         p  = (uint32_t *) &(map->exec[(addr - map->base) & map->mask]);
         *p = val;
-    } else if (((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_QBOUND) && (map && map->write_l))
+        mem_phys_written(addr, 4);
+    } else if (((addr & MEM_GRANULARITY_MASK) <= MEM_GRANULARITY_QBOUND) && (map && map->write_l)) {
         map->write_l(addr, val, map->priv);
-    else {
+        mem_phys_written(addr, 4);
+    } else {
         mem_writew_phys(addr, val & 0xffff);
         mem_writew_phys(addr + 2, (val >> 16) & 0xffff);
     }
@@ -1919,6 +1970,7 @@ mem_write_phys_block(const void *src, uint32_t addr, uint32_t len)
             break;
 
         memcpy(&(map->exec[off]), p + done, chunk);
+        mem_phys_written(addr, chunk);
         addr += chunk;
         done += chunk;
     }
@@ -2042,7 +2094,7 @@ mem_write_ramw_page(uint32_t addr, uint16_t val, page_t *page)
         int      byte_offset = (addr >> PAGE_BYTE_MASK_SHIFT) & PAGE_BYTE_MASK_OFFSET_MASK;
         uint64_t byte_mask   = (uint64_t) 1 << (addr & PAGE_BYTE_MASK_MASK);
 
-        if ((addr & 0xf) == 0xf)
+        if ((addr & PAGE_BYTE_MASK_MASK) == PAGE_BYTE_MASK_MASK)
             mask |= (mask << 1);
         *(uint16_t *) &page->mem[addr & 0xfff] = val;
         page->dirty_mask |= mask;
@@ -2077,7 +2129,7 @@ mem_write_raml_page(uint32_t addr, uint32_t val, page_t *page)
         int      byte_offset = (addr >> PAGE_BYTE_MASK_SHIFT) & PAGE_BYTE_MASK_OFFSET_MASK;
         uint64_t byte_mask   = (uint64_t) 0xf << (addr & PAGE_BYTE_MASK_MASK);
 
-        if ((addr & 0xf) >= 0xd)
+        if ((addr & PAGE_BYTE_MASK_MASK) > (PAGE_BYTE_MASK_MASK - 3))
             mask |= (mask << 1);
         *(uint32_t *) &page->mem[addr & 0xfff] = val;
         page->dirty_mask |= mask;
@@ -2091,6 +2143,47 @@ mem_write_raml_page(uint32_t addr, uint32_t val, page_t *page)
             if ((page->byte_code_present_mask[byte_offset + 1] & byte_mask_2) && !page_in_evict_list(page))
                 page_add_to_evict_list(page);
         }
+    }
+}
+
+/* A device or the emulator wrote len bytes of RAM at physical addr straight
+   to memory: mark them dirty as a processor write would, so that code
+   compiled from them is not run again. A real processor snoops every write
+   to memory, not only its own. */
+static void
+mem_phys_written(uint32_t addr, uint32_t len)
+{
+    while (len) {
+        uint32_t off = addr & 0xfff;
+        uint32_t n   = 0x1000 - off;
+
+        if (n > len)
+            n = len;
+        if ((addr >> 12) < pages_sz) {
+            page_t *page = &pages[addr >> 12];
+
+            if ((page->mem != NULL) && (page->mem != page_ff) && (page->byte_dirty_mask != NULL)) {
+                uint32_t first = off >> PAGE_BYTE_MASK_SHIFT;
+                uint32_t last  = (off + n - 1) >> PAGE_BYTE_MASK_SHIFT;
+                int      code  = 0;
+
+                for (uint32_t c = first; c <= last; c++) {
+                    uint32_t lo    = (c == first) ? (off & PAGE_BYTE_MASK_MASK) : 0;
+                    uint32_t hi    = (c == last) ? ((off + n - 1) & PAGE_BYTE_MASK_MASK) : PAGE_BYTE_MASK_MASK;
+                    uint64_t bytes = (UINT64_MAX >> (PAGE_BYTE_MASK_MASK - hi)) & (UINT64_MAX << lo);
+                    uint64_t mask  = (uint64_t) 1 << c;
+
+                    page->dirty_mask |= mask;
+                    page->byte_dirty_mask[c] |= bytes;
+                    if ((page->code_present_mask & mask) || (page->byte_code_present_mask[c] & bytes))
+                        code = 1;
+                }
+                if (code && !page_in_evict_list(page))
+                    page_add_to_evict_list(page);
+            }
+        }
+        addr += n;
+        len -= n;
     }
 }
 
@@ -2199,7 +2292,7 @@ mem_write_remapped(uint32_t addr, uint8_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xA0000 + (addr - remap_start_addr);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_ramb_page(addr, val, &pages[oldaddr >> 12]);
     } else
         ram[addr] = val;
@@ -2211,7 +2304,7 @@ mem_write_remappedw(uint32_t addr, uint16_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xA0000 + (addr - remap_start_addr);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_ramw_page(addr, val, &pages[oldaddr >> 12]);
     } else
         *(uint16_t *) &ram[addr] = val;
@@ -2223,7 +2316,7 @@ mem_write_remappedl(uint32_t addr, uint32_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xA0000 + (addr - remap_start_addr);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_raml_page(addr, val, &pages[oldaddr >> 12]);
     } else
         *(uint32_t *) &ram[addr] = val;
@@ -2235,7 +2328,7 @@ mem_write_remapped2(uint32_t addr, uint8_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xD0000 + (addr - remap_start_addr2);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_ramb_page(addr, val, &pages[oldaddr >> 12]);
     } else
         ram[addr] = val;
@@ -2247,7 +2340,7 @@ mem_write_remappedw2(uint32_t addr, uint16_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xD0000 + (addr - remap_start_addr2);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_ramw_page(addr, val, &pages[oldaddr >> 12]);
     } else
         *(uint16_t *) &ram[addr] = val;
@@ -2259,7 +2352,7 @@ mem_write_remappedl2(uint32_t addr, uint32_t val, UNUSED(void *priv))
     uint32_t oldaddr = addr;
     addr             = 0xD0000 + (addr - remap_start_addr2);
     if (cpu_use_exec) {
-        addwritelookup(mem_logical_addr, addr);
+        addwritelookup_remapped(mem_logical_addr, oldaddr, addr);
         mem_write_raml_page(addr, val, &pages[oldaddr >> 12]);
     } else
         *(uint32_t *) &ram[addr] = val;
@@ -2326,6 +2419,13 @@ mem_mapping_access_allowed(uint32_t flags, uint16_t access)
     return ret;
 }
 
+/* The bus's view: a mapping that is the processor's own is not on it. */
+static __inline int
+mem_mapping_bus_access_allowed(uint32_t flags, uint16_t access)
+{
+    return !(flags & MEM_MAPPING_CPU_ONLY) && mem_mapping_access_allowed(flags, access);
+}
+
 /* One granule of one mapping, put where an access of each kind will find it. */
 static void
 mem_mapping_apply_granule(mem_mapping_t *map, uint64_t c, int n)
@@ -2342,9 +2442,9 @@ mem_mapping_apply_granule(mem_mapping_t *map, uint64_t c, int n)
     n |= STATE_BUS;
     wp = _mem_wp_bus[c >> MEM_GRANULARITY_BITS];
 
-    if (!wp && (map->write_b || map->write_w || map->write_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
+    if (!wp && (map->write_b || map->write_w || map->write_l) && mem_mapping_bus_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
         write_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
-    if ((map->read_b || map->read_w || map->read_l) && mem_mapping_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
+    if ((map->read_b || map->read_w || map->read_l) && mem_mapping_bus_access_allowed(map->flags, _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
         read_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
 }
 
@@ -2390,6 +2490,8 @@ mem_mapping_recalc(uint64_t base, uint64_t size, uint32_t base_ignore)
        and overwrites whatever follows them. */
     if ((base + size + (base_ignore & mask)) > MEM_ADDR_SPACE_END)
         mem_mapping_past_4g(base, size, base_ignore & (uint32_t) mask);
+
+    mem_mapping_gen++;
 
     map = base_mapping;
 
@@ -2456,12 +2558,12 @@ mem_mapping_recalc(uint64_t base, uint64_t size, uint32_t base_ignore)
                     wp = _mem_wp_bus[c >> MEM_GRANULARITY_BITS];
 
                     if (!wp && (map->write_b || map->write_w || map->write_l) &&
-                        mem_mapping_access_allowed(map->flags,
-                                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
+                        mem_mapping_bus_access_allowed(map->flags,
+                                                       _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
                         write_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
                     if ((map->read_b || map->read_w || map->read_l) &&
-                        mem_mapping_access_allowed(map->flags,
-                                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
+                        mem_mapping_bus_access_allowed(map->flags,
+                                                       _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
                         read_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
                 }
             } else  for (i_c = i_s; i_c <= i_e; i_c += i_a) {
@@ -2487,12 +2589,12 @@ mem_mapping_recalc(uint64_t base, uint64_t size, uint32_t base_ignore)
                     wp = _mem_wp_bus[c >> MEM_GRANULARITY_BITS];
 
                     if (!wp && (map->write_b || map->write_w || map->write_l) &&
-                        mem_mapping_access_allowed(map->flags,
-                                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
+                        mem_mapping_bus_access_allowed(map->flags,
+                                                       _mem_state[c >> MEM_GRANULARITY_BITS].states[n].w))
                         write_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
                     if ((map->read_b || map->read_w || map->read_l) &&
-                        mem_mapping_access_allowed(map->flags,
-                                                   _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
+                        mem_mapping_bus_access_allowed(map->flags,
+                                                       _mem_state[c >> MEM_GRANULARITY_BITS].states[n].r))
                         read_mapping_bus[c >> MEM_GRANULARITY_BITS] = map;
                 }
             }

@@ -212,6 +212,11 @@ acpi_update_irq(acpi_t *dev)
             break;
     }
 
+    /* The southbridge's view of SCI, apart from the line it is steered to
+       (acpi_set_sci_hook). */
+    if (dev->sci_hook)
+        dev->sci_hook(dev->sci_hook_priv, (dev->regs.pmcntrl & 0x01) && sci_level);
+
     if ((dev->regs.pmcntrl & 0x01) && sci_level)  switch (dev->irq_mode) {
         default:
             if (dev->irq_line != 0)
@@ -272,6 +277,16 @@ acpi_raise_smi(void *priv, int do_smi)
                 smi_raise();
         }
     }
+}
+
+void
+acpi_gp_timer_timeout(void *priv, int n)
+{
+    acpi_t *dev = (acpi_t *) priv;
+
+    dev->regs.glbsts |= (0x04 << n);          /* bit 2 = GP0, bit 3 = GP1 */
+    if (dev->regs.glben & (0x04 << n))
+        acpi_raise_smi(dev, 1);
 }
 
 static uint32_t
@@ -1390,8 +1405,19 @@ acpi_reg_write_via(int size, uint16_t addr, uint8_t val, void *priv)
         case 0x42:
             /* GPIO port Output Value */
             if (size == 1) {
-                dev->regs.gpio_val = val & 0x13;
+                int old = dev->regs.gpio_val;
+
+                dev->regs.gpio_val = val & 0x1f; /* GPIO0-4 on the 586B */
                 acpi_i2c_set(dev);
+
+                /* The TX100 BIOS resets the machine by driving GPIO3 low, then spins. */
+                if ((machines[machine].init == machine_at_tx100_init) &&
+                    (dev->regs.gpio_dir & 0x08) &&
+                    (old & 0x08) && !(val & 0x08)) {
+                    acpi_log("ACPI: GPIO3 driven low, resetting the machine\n");
+                    pci_write(0xcf9, 0x00, NULL);
+                    pci_write(0xcf9, 0x06, NULL);
+                }
             }
             break;
         case 0x46:
@@ -2320,6 +2346,13 @@ acpi_set_trap_update(acpi_t *dev, void (*update)(void *priv), void *priv)
     dev->trap_priv   = priv;
 }
 
+void
+acpi_set_sci_hook(acpi_t *dev, void (*hook)(void *priv, int set), void *priv)
+{
+    dev->sci_hook      = hook;
+    dev->sci_hook_priv = priv;
+}
+
 uint8_t
 acpi_ali_soft_smi_status_read(acpi_t *dev)
 {
@@ -2506,8 +2539,10 @@ acpi_reset(void *priv)
     }
 
     if (acpi_power_on) {
-        /* Power on always generates a resume event. */
-        // dev->regs.pmsts |= 0x8100;
+        if (machines[machine].init != machine_at_sp97xv_init)
+            /* Power on always generates a resume event. */
+            dev->regs.pmsts |= 0x8100;
+        
         acpi_power_on = 0;
     }
 
@@ -2533,9 +2568,11 @@ acpi_reset(void *priv)
         dev->regs.gpe_io = 0x00030b9f;
         dev->regs.gpe_mul = 0x1001;
 
-        /* Fix for the IN530 CMOS reset jumper */
-        if (machines[machine].init == machine_at_in530_init)
-            dev->regs.gpe_pin = 0x0003ffff;
+        /* SiS 5595 GPIO pin defaults. */
+        uint32_t gpio = machine_get_gpio_acpi_default();
+
+        if (gpio != 0xffffffff)
+            dev->regs.gpe_pin = gpio & 0x0003ffff;
     }
 
     if (dev->vendor == VEN_SIS_5582) {

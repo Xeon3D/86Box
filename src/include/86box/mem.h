@@ -19,6 +19,8 @@
 #ifndef EMU_MEM_H
 #define EMU_MEM_H
 
+#include <stdint.h>
+
 #define MEM_MAP_TO_SHADOW_RAM_MASK 1
 #define MEM_MAP_TO_RAM_ADDR_MASK   2
 
@@ -119,6 +121,8 @@
 #define MEM_MAPPING_CACHE_ONLY 128 /* Lines held in the processor's cache: seen only where
                                      the CPU's access state has ACCESS_CACHE, and never
                                      by the bus (mem_set_cache_access). */
+#define MEM_MAPPING_CPU_ONLY  256 /* The processor's own: seen by its accesses and never
+                                     by a bus master's (mem_*_phys). */
 
 /* #define's for memory granularity, currently 4k, less does
    not work because of internal 4k pages. */
@@ -226,6 +230,16 @@ typedef struct page_t {
 
     uint64_t *byte_dirty_mask;
     uint64_t *byte_code_present_mask;
+
+    /*Self-modifying-code thrash tracking: a block recompiled for this page
+      and discarded again before it was ever reused (see codeblock_t::reused)
+      bumps smc_strikes and arms smc_cooldown_until (a tsc deadline). While
+      cooldown is active, the dynarec skips compiling code on this page and
+      runs it through the plain interpreter instead, since compiling code
+      that is rewritten before it can be reused just adds cost with no
+      payback. A block that *is* reused resets smc_strikes to 0.*/
+    uint8_t  smc_strikes;
+    uint64_t smc_cooldown_until;
 } page_t;
 
 extern uint32_t purgable_page_list_head;
@@ -340,6 +354,7 @@ extern uint64_t mmutranslatereal(uint32_t addr, int rw);
 extern uint32_t mmutranslatereal32(uint32_t addr, int rw);
 extern void     addreadlookup(uint32_t virt, uint32_t phys);
 extern void     addwritelookup(uint32_t virt, uint32_t phys);
+extern void     addwritelookup_remapped(uint32_t virt, uint32_t phys, uint32_t ram_addr);
 
 extern void mem_mapping_set(mem_mapping_t *,
                             uint32_t base,
@@ -394,6 +409,10 @@ extern void mem_set_wp(uint64_t base, uint64_t size, uint8_t flags, uint8_t wp);
 extern void mem_set_access(uint8_t bitmap, int mode, uint32_t base, uint32_t size, uint16_t access);
 extern void mem_set_cache_access(uint32_t base, uint32_t size, int cached);
 extern int  mem_bus_unbacked(uint32_t base, uint32_t size);
+
+extern const uint8_t *mem_phys_ptr(uint32_t addr, uint32_t len);
+extern uint32_t       mem_mapping_gen;
+extern size_t         mem_ram_size(void);
 
 extern uint8_t  mem_readb_phys(uint32_t addr);
 extern uint16_t mem_readw_phys(uint32_t addr);

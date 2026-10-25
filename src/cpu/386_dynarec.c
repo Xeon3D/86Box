@@ -45,6 +45,7 @@
 #endif
 
 #include "386_common.h"
+#include "x86_interrupt.h"
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #    include <pthread.h>
@@ -538,9 +539,9 @@ exec386_dynarec_int_common(const int dbg)
             CPU_BLOCK_END();
         else if (trap)
             CPU_BLOCK_END();
-        else if (nmi && nmi_enable && nmi_mask)
+        else if (NMI_TAKEABLE())
             CPU_BLOCK_END();
-        else if ((cpu_state.flags & I_FLAG) && pic.int_pending && !cpu_end_block_after_ins)
+        else if ((cpu_state.flags & I_FLAG) && x86_external_interrupt_pending() && !cpu_end_block_after_ins)
             CPU_BLOCK_END();
     }
 
@@ -600,6 +601,14 @@ exec386_dynarec_dyn(void)
        fetched through the device's read handlers, and nothing tracks writes
        there, so it is interpreted every time rather than kept in a block. */
     if (!cpu_state.abrt && (_mem_exec[phys_addr >> MEM_GRANULARITY_BITS] == NULL)) {
+        exec386_dynarec_int();
+        return;
+    }
+    /* This page keeps getting its freshly-compiled code rewritten before any
+       of it is ever reused (see invalidate_block()/page_t::smc_strikes):
+       compiling it again would just pay the same cost for nothing again, so
+       interpret it instead until the cooldown lapses. */
+    if (!cpu_state.abrt && (pages[phys_addr >> 12].smc_cooldown_until > tsc)) {
         exec386_dynarec_int();
         return;
     }
@@ -728,7 +737,8 @@ exec386_dynarec_dyn(void)
         void (*code)(void) = (void *) &block->data[BLOCK_START];
 #    endif
 
-        block->used = 1; /* run: the eviction sweep passes it over once */
+        block->used   = 1; /* run: the eviction sweep passes it over once */
+        block->reused = 1; /* reached via block->data: compiling it paid off */
         inrecomp = 1;
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
         /* A block compiled without links returns nothing. */
@@ -816,9 +826,9 @@ exec386_dynarec_dyn(void)
                 CPU_BLOCK_END();
             if (smi_line)
                 CPU_BLOCK_END();
-            if (nmi && nmi_enable && nmi_mask)
+            if (NMI_TAKEABLE())
                 CPU_BLOCK_END();
-            if ((cpu_state.flags & I_FLAG) && pic.int_pending && !cpu_end_block_after_ins)
+            if ((cpu_state.flags & I_FLAG) && x86_external_interrupt_pending() && !cpu_end_block_after_ins)
                 CPU_BLOCK_END();
 
             if (cpu_end_block_after_ins) {
@@ -939,9 +949,9 @@ exec386_dynarec_dyn(void)
                 CPU_BLOCK_END();
             if (smi_line)
                 CPU_BLOCK_END();
-            if (nmi && nmi_enable && nmi_mask)
+            if (NMI_TAKEABLE())
                 CPU_BLOCK_END();
-            if ((cpu_state.flags & I_FLAG) && pic.int_pending && !cpu_end_block_after_ins)
+            if ((cpu_state.flags & I_FLAG) && x86_external_interrupt_pending() && !cpu_end_block_after_ins)
                 CPU_BLOCK_END();
 
             if (cpu_end_block_after_ins) {
@@ -1080,7 +1090,7 @@ exec386_dynarec_common(int32_t cycs, const int dbg)
                 enter_smm_check(0);
                 if (in_smm != before)
                     cpu_halted = 0;
-            } else if (nmi && nmi_enable && nmi_mask) {
+            } else if (NMI_TAKEABLE()) {
                 /* Out of a HLT that left pc on itself: "the saved CS:IP (or
                    CS:EIP) value points to the instruction following the HLT
                    instruction" (Pentium Vol. 3, HLT), NMI included. */
@@ -1099,8 +1109,8 @@ exec386_dynarec_common(int32_t cycs, const int dbg)
 #    else
                 nmi = 0;
 #    endif
-            } else if ((cpu_state.flags & I_FLAG) && pic.int_pending) {
-                vector = picinterrupt();
+            } else if ((cpu_state.flags & I_FLAG) && x86_external_interrupt_pending()) {
+                vector = x86_external_interrupt_vector();
                 if (vector != -1) {
                     /* An interrupt that came after the HLT looked: past the
                        HLT, as above. */
@@ -1511,7 +1521,7 @@ block_ended:
 
             if (smi_line)
                 enter_smm_check(0);
-            else if (nmi && nmi_enable && nmi_mask) {
+            else if (NMI_TAKEABLE()) {
                 oldcs = CS;
                 cpu_state.oldpc = cpu_state.pc;
                 x86_int(2);
@@ -1524,8 +1534,8 @@ block_ended:
 #else
                 nmi = 0;
 #endif
-            } else if ((cpu_state.flags & I_FLAG) && pic.int_pending && !cpu_end_block_after_ins) {
-                vector = picinterrupt();
+            } else if ((cpu_state.flags & I_FLAG) && x86_external_interrupt_pending() && !cpu_end_block_after_ins) {
+                vector = x86_external_interrupt_vector();
                 if (vector != -1) {
                     flags_rebuild();
                     if (msw & 1)
