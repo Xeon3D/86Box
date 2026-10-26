@@ -1,0 +1,19 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository != '86Box/86Box'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge 86Box/86Box master into this fork's master
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+        run: gh api --method POST "repos/${{ github.repository }}/merge-upstream" -f branch=master
