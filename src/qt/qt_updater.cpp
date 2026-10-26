@@ -30,7 +30,6 @@
 #include <QNetworkRequest>
 #include <QProcess>
 #include <QPushButton>
-#include <QRegularExpression>
 #include <QTemporaryFile>
 #include <QThread>
 #include <QVector>
@@ -60,23 +59,74 @@ QString Updater::launchPath;
 
 namespace {
 
-/* The download for this operating system and architecture, empty if there is none. */
-QString
-artifactPattern()
+/* How the download for this operating system and architecture is told apart
+   from the others: by its type, and by the start of its name or else the
+   folder the CI puts it in. Only the start of the name is relied upon, so
+   whatever follows it (a tag, the build number) may change. */
+struct ArtifactKind {
+    const char *prefix;
+    const char *folder;
+    const char *extension;
+    /* Also required in the name, if set: the architecture, should a build
+       for several (the universal macOS one) ever be split. */
+    const char *architecture = nullptr;
+};
+
+/* The kind of download for this system, or nullptr if there is none. */
+const ArtifactKind *
+artifactKind()
 {
 #if defined(Q_OS_WINDOWS) && defined(Q_PROCESSOR_X86_64)
-    return QStringLiteral("^86Box-Windows-64-b\\d+\\.zip$");
+    static const ArtifactKind kind = { "86Box-Windows-64-", "Windows - x64 (64-bit)/", ".zip" };
 #elif defined(Q_OS_WINDOWS) && defined(Q_PROCESSOR_ARM_64)
-    return QStringLiteral("^86Box-Windows-ARM64-b\\d+\\.zip$");
+    static const ArtifactKind kind = { "86Box-Windows-ARM64-", "Windows - ARM (64-bit)/", ".zip" };
 #elif defined(Q_OS_LINUX) && defined(Q_PROCESSOR_X86_64)
-    return QStringLiteral("^86Box-Linux-x86_64-b\\d+\\.AppImage$");
+    static const ArtifactKind kind = { "86Box-Linux-x86_64-", "Linux - x64 (64-bit)/", ".AppImage" };
 #elif defined(Q_OS_LINUX) && defined(Q_PROCESSOR_ARM_64)
-    return QStringLiteral("^86Box-Linux-arm64-b\\d+\\.AppImage$");
+    static const ArtifactKind kind = { "86Box-Linux-arm64-", "Linux - ARM (64-bit)/", ".AppImage" };
+#elif defined(Q_OS_MACOS) && defined(Q_PROCESSOR_ARM_64)
+    static const ArtifactKind kind = { "86Box-macOS-", "macOS - Universal (Intel and Apple Silicon)/", ".zip", "arm64" };
 #elif defined(Q_OS_MACOS)
-    return QStringLiteral("^86Box-macOS-.+-b\\d+\\.zip$");
+    static const ArtifactKind kind = { "86Box-macOS-", "macOS - Universal (Intel and Apple Silicon)/", ".zip", "x86_64" };
 #else
-    return {};
+    return nullptr;
 #endif
+#if defined(Q_OS_WINDOWS) || defined(Q_OS_LINUX) || defined(Q_OS_MACOS)
+    return &kind;
+#endif
+}
+
+/* The download for this system among the artifacts of a build, empty if there
+   is none. A match by name is preferred to one by folder, and the shortest
+   name to longer ones, which may be extras such as debug symbols. */
+QJsonObject
+findArtifact(const QJsonArray &artifacts, const ArtifactKind &kind)
+{
+    QJsonObject byName;
+    QJsonObject byFolder;
+
+    const auto shorter = [](const QJsonObject &artifact, const QJsonObject &than) {
+        return than.isEmpty() || (artifact["fileName"].toString().size() < than["fileName"].toString().size());
+    };
+
+    for (const auto &value : artifacts) {
+        const auto    artifact = value.toObject();
+        const QString name     = artifact["fileName"].toString();
+        const QString path     = artifact["relativePath"].toString();
+
+        if (!name.endsWith(kind.extension, Qt::CaseInsensitive)
+            || (kind.architecture && !name.contains(kind.architecture, Qt::CaseInsensitive)))
+            continue;
+        if (name.startsWith(kind.prefix, Qt::CaseInsensitive)) {
+            if (shorter(artifact, byName))
+                byName = artifact;
+        } else if (path.startsWith(kind.folder, Qt::CaseInsensitive)) {
+            if (shorter(artifact, byFolder))
+                byFolder = artifact;
+        }
+    }
+
+    return byName.isEmpty() ? byFolder : byName;
 }
 
 /* What an update replaces: the executable on Windows, the AppImage on Linux
@@ -471,7 +521,7 @@ Updater::isSupported(QString *reason)
 #elif defined(RELEASE_BUILD)
     return unsupported(tr("This is a release build of %1. Automatic updates only install experimental builds, so they are not available in release builds.").arg(EMU_NAME));
 #else
-    if (artifactPattern().isEmpty())
+    if (!artifactKind())
         return unsupported(tr("Automatic updates are not available for this operating system or architecture."));
 
     const QString target = installTarget();
@@ -782,36 +832,36 @@ Updater::fetchLatest(std::function<void(const Updater::Build &, const QString &)
         }
 
         /* The builds are listed newest first; the latest is the newest
-           successful one with a download for this system. */
-        const auto               builds = QJsonDocument::fromJson(buildsReply->readAll()).object()["builds"].toArray();
-        const QRegularExpression pattern(artifactPattern());
-        Build                    latest;
-        int                      index = 0;
-        for (; (index < builds.size()) && (latest.number <= 0); index++) {
-            const auto build = builds[index].toObject();
-            if (build["result"].toString() != "SUCCESS")
-                continue;
-            for (const auto &value : build["artifacts"].toArray()) {
-                const auto artifact = value.toObject();
-                if (pattern.match(artifact["fileName"].toString()).hasMatch()) {
-                    latest.number   = build["number"].toInt();
-                    latest.fileName = artifact["fileName"].toString();
-                    latest.url      = QUrl(QString(artifactUrl).arg(latest.number).arg(artifact["relativePath"].toString()));
-                    break;
-                }
-            }
-        }
-        if (latest.number <= 0) {
+           successful one. */
+        const auto builds = QJsonDocument::fromJson(buildsReply->readAll()).object()["builds"].toArray();
+        int        index  = 0;
+        while ((index < builds.size()) && (builds[index].toObject()["result"].toString() != "SUCCESS"))
+            index++;
+        if (index >= builds.size()) {
             callback({}, tr("Unable to determine release information"));
             return;
         }
+
+        /* An older build is never offered in its place: if the latest has no
+           download for this system, likely because the downloads were renamed,
+           the check fails rather than quietly finding nothing new. */
+        Build      latest;
+        const auto newest   = builds[index].toObject();
+        const auto artifact = findArtifact(newest["artifacts"].toArray(), *artifactKind());
+        latest.number       = newest["number"].toInt();
+        if (artifact.isEmpty() || (latest.number <= 0)) {
+            callback({}, tr("Build %1 has no download for this system.").arg(latest.number));
+            return;
+        }
+        latest.fileName = artifact["fileName"].toString();
+        latest.url      = QUrl(QString(artifactUrl).arg(latest.number).arg(artifact["relativePath"].toString()));
 
         /* A build lists the commits since the build before it, whatever its
            result, so the changes of every build since the installed one are
            part of the update. */
         const int   installed = installedBuild();
         QStringList changes;
-        for (index--; index < builds.size(); index++) {
+        for (; index < builds.size(); index++) {
             const auto build  = builds[index].toObject();
             const int  number = build["number"].toInt();
             if (number <= installed)
