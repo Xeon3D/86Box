@@ -261,6 +261,22 @@ load_global_manager(void)
 }
 
 static void
+load_global_updates(void)
+{
+    ini_section_t cat = ini_find_section(global, "Updates");
+
+    update_auto = !!ini_section_get_int(cat, "auto_update", 0);
+
+    update_interval = ini_section_get_int(cat, "interval", UPDATE_INTERVAL_DAILY);
+    if ((update_interval < 0) || (update_interval >= UPDATE_INTERVAL_MAX))
+        update_interval = UPDATE_INTERVAL_DAILY;
+
+    update_restart_prompt = !!ini_section_get_int(cat, "restart_prompt", 1);
+    update_skip_build     = ini_section_get_int(cat, "skip_build", 0);
+    update_pin_build      = ini_section_get_int(cat, "pin_build", 0);
+}
+
+static void
 load_global_legacy(void)
 {
     ini_section_t cat = ini_find_section(global, "");
@@ -317,6 +333,7 @@ load_global(void)
     load_global_keybinds();            /* Load shortcut keybinds */
 
     load_global_manager();
+    load_global_updates();
 
     if (!new_loaded)
         load_global_legacy();
@@ -3286,6 +3303,39 @@ save_global_manager(void)
     ini_delete_section_if_empty(global, cat);
 }
 
+static void
+save_global_updates(void)
+{
+    ini_section_t cat = ini_find_or_create_section(global, "Updates");
+
+    if (update_auto)
+        ini_section_set_int(cat, "auto_update", update_auto);
+    else
+        ini_section_delete_var(cat, "auto_update");
+
+    if (update_interval != UPDATE_INTERVAL_DAILY)
+        ini_section_set_int(cat, "interval", update_interval);
+    else
+        ini_section_delete_var(cat, "interval");
+
+    if (update_restart_prompt != 1)
+        ini_section_set_int(cat, "restart_prompt", update_restart_prompt);
+    else
+        ini_section_delete_var(cat, "restart_prompt");
+
+    if (update_skip_build)
+        ini_section_set_int(cat, "skip_build", update_skip_build);
+    else
+        ini_section_delete_var(cat, "skip_build");
+
+    if (update_pin_build)
+        ini_section_set_int(cat, "pin_build", update_pin_build);
+    else
+        ini_section_delete_var(cat, "pin_build");
+
+    ini_delete_section_if_empty(global, cat);
+}
+
 /* Save global configuration */
 static void
 save_global(void)
@@ -3297,6 +3347,7 @@ save_global(void)
     save_global_keybinds();
 
     save_global_manager();
+    save_global_updates();
 }
 
 /* Save scan code mappings. */

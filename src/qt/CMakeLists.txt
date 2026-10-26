@@ -177,6 +177,9 @@ add_library(ui STATIC
     qt_preferencesmanager.cpp
     qt_preferencesmanager.hpp
     qt_preferencesmanager.ui
+    qt_preferencesupdates.cpp
+    qt_preferencesupdates.hpp
+    qt_preferencesupdates.ui
 
     qt_settings.cpp
     qt_settings.hpp
@@ -273,6 +276,9 @@ add_library(ui STATIC
 
     qt_downloader.cpp
     qt_downloader.hpp
+
+    qt_updater.cpp
+    qt_updater.hpp
 
     qt_vmmanager_clientsocket.cpp
     qt_vmmanager_clientsocket.hpp
@@ -505,6 +511,10 @@ target_link_libraries(ui PRIVATE
     Qt${QT_MAJOR}::Network
     Threads::Threads
 )
+
+# The updater extracts the zip archives of the builds.
+find_package(ZLIB REQUIRED)
+target_link_libraries(ui PRIVATE ZLIB::ZLIB)
 
 if (LIBRASHADER)
     target_compile_definitions(plat PRIVATE LIBRA_RUNTIME_VULKAN)

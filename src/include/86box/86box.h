@@ -263,7 +263,21 @@ extern int    vmm_update_check;             /* (G) check for updates when the ma
 extern int    vmm_regex_search;             /* (G) search the manager with regular expressions */
 extern int    vmm_window_remember;          /* (G) remember the manager's window size and position */
 extern int    vmm_delete_to_trash;          /* (G) delete machines to the trash */
+extern int    update_auto;                  /* (G) automatically check for and install updates */
+extern int    update_interval;              /* (G) how often to check for updates, UPDATE_INTERVAL_* */
+extern int    update_restart_prompt;        /* (G) ask to restart after an update was installed */
+extern int    update_skip_build;            /* (G) build the user chose not to install */
+extern int    update_pin_build;             /* (G) build the user chose to stay on, 0 = none */
 extern int    gdbstub_port;                 /* (C) The GDB stub port. */
+
+enum {
+    UPDATE_INTERVAL_6_HOURS = 0,
+    UPDATE_INTERVAL_12_HOURS,
+    UPDATE_INTERVAL_DAILY,
+    UPDATE_INTERVAL_WEEKLY,
+    UPDATE_INTERVAL_MONTHLY,
+    UPDATE_INTERVAL_MAX
+};
 
 extern char exe_path[2048];        /* path (dir) of executable */
 extern char usr_path[1024];        /* path (dir) of user data */

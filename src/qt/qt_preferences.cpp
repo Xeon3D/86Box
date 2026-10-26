@@ -43,6 +43,7 @@ extern "C" {
 #include "qt_preferencesinput.hpp"
 #include "qt_preferenceskeybindings.hpp"
 #include "qt_preferencesmanager.hpp"
+#include "qt_preferencesupdates.hpp"
 #include "qt_defs.hpp"
 
 #include <QDebug>
@@ -68,9 +69,10 @@ static const QVector<PagedDialog::Page> preferencesPages = {
     { "Emulator",     "emulator"      },
     { "Input",        "input_devices" },
     { "Key bindings", "key_bindings"  },
+    { "Updates",      "updates"       },
 };
 
-static const PagedDialog::Page managerPage = { "VM Manager", "86Box-gray" };
+static const PagedDialog::Page managerPage = { "VM Manager", "vm_manager" };
 
 static QVector<PagedDialog::Page>
 pageList(bool showManager)
@@ -129,11 +131,13 @@ Preferences::Preferences(bool showManager, bool machinesRunning, QWidget *parent
     emulator                  = new PreferencesEmulator(this);
     input                     = new PreferencesInput(this);
     key_bindings              = new PreferencesKeyBindings(this);
+    updates                   = new PreferencesUpdates(this);
 
     pageStack()->addWidget(general);
     pageStack()->addWidget(emulator);
     pageStack()->addWidget(input);
     pageStack()->addWidget(key_bindings);
+    pageStack()->addWidget(updates);
 
     if (showManager) {
         manager = new PreferencesManager(machinesRunning, this);
@@ -157,6 +161,7 @@ Preferences::save()
     emulator->save();
     input->save();
     key_bindings->save();
+    updates->save();
     if (manager)
         manager->save();
 }

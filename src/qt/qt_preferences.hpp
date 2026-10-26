@@ -10,6 +10,7 @@ class PreferencesEmulator;
 class PreferencesInput;
 class PreferencesKeyBindings;
 class PreferencesManager;
+class PreferencesUpdates;
 
 /* The preferences of the emulator and the VM manager, saved to the global
    configuration. The pages only save the preferences; applying them is up
@@ -63,6 +64,7 @@ private:
     PreferencesEmulator        *emulator;
     PreferencesInput           *input;
     PreferencesKeyBindings     *key_bindings;
+    PreferencesUpdates         *updates;
     PreferencesManager         *manager = nullptr;
 };
 

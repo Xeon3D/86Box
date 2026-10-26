@@ -236,6 +236,11 @@ int      vmm_update_check                       = 1;              /* (G) check f
 int      vmm_regex_search                       = 0;              /* (G) search the manager with regular expressions */
 int      vmm_window_remember                    = 0;              /* (G) remember the manager's window size and position */
 int      vmm_delete_to_trash                    = 0;              /* (G) delete machines to the trash */
+int      update_auto                            = 0;              /* (G) automatically check for and install updates */
+int      update_interval                        = UPDATE_INTERVAL_DAILY; /* (G) how often to check for updates */
+int      update_restart_prompt                  = 1;              /* (G) ask to restart after an update was installed */
+int      update_skip_build                      = 0;              /* (G) build the user chose not to install */
+int      update_pin_build                       = 0;              /* (G) build the user chose to stay on, 0 = none */
 
 int      other_ide_present = 0;                                   /* IDE controllers from non-IDE cards are
                                                                      present */

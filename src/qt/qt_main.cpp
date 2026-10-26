@@ -86,6 +86,7 @@ extern "C" {
 #include "qt_unixmanagerfilter.hpp"
 #include "qt_util.hpp"
 #include "qt_vmmanager_clientsocket.hpp"
+#include "qt_updater.hpp"
 #include "qt_vmmanager_config.hpp"
 #include "qt_vmmanager_mainwindow.hpp"
 
@@ -724,8 +725,12 @@ main(int argc, char *argv[])
             vmm_dark_mode_filter = darkModeFilter.get();
 #endif
             vmm_main_window->show();
+            Updater::instance()->start(vmm_main_window, Updater::Role::Manager, [vmm_main_window](const QString &message) {
+                vmm_main_window->setStatusLeft(message);
+            });
         });
         QApplication::exec();
+        Updater::relaunchIfRequested();
         return 0;
     }
 
@@ -939,6 +944,13 @@ main(int argc, char *argv[])
         manager_socket.sendWinIdMessage(main_window->winId());
     }
 
+    /* Updates are left to the manager of a supervised machine. */
+    if (qgetenv("86BOX_MANAGER_SOCKET").isEmpty() && qgetenv("VMM_86BOX_SOCKET").isEmpty()) {
+        Updater::instance()->start(main_window, Updater::Role::Machine, [](const QString &message) {
+            emit main_window->statusBarMessage(message);
+        });
+    }
+
     // pc_reset_hard_init();
 
     QTimer onesec;
@@ -978,6 +990,7 @@ main(int argc, char *argv[])
     endblit();
 
     socket.close();
+    Updater::relaunchIfRequested();
     return ret;
 }
 

@@ -16,10 +16,8 @@
 #include "qt_vmmanager_main.hpp"
 #include "qt_vmmanager_windarkmodefilter.hpp"
 #include "ui_qt_vmmanager_mainwindow.h"
-#ifdef UPDATE_CHECK
-#    include "qt_updatecheckdialog.hpp"
-#endif
 #include "qt_about.hpp"
+#include "qt_updater.hpp"
 #include "qt_preferences.hpp"
 #include "qt_util.hpp"
 
@@ -324,12 +322,7 @@ VMManagerMainWindow::on_actionHide_tool_bar_triggered()
 void
 VMManagerMainWindow::checkForUpdatesTriggered()
 {
-    auto updateChannel = UpdateCheck::UpdateChannel::CI;
-#    ifdef RELEASE_BUILD
-    updateChannel = UpdateCheck::UpdateChannel::Stable;
-#    endif
-    const auto updateCheck = new UpdateCheckDialog(updateChannel, this);
-    updateCheck->exec();
+    Updater::instance()->checkInteractively(this);
 }
 #endif
 
