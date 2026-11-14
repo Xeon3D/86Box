@@ -1,0 +1,105 @@
+name: Haiku
+
+# Builds the Qt 6 version for Haiku R1/beta6 x86_64. GitHub has no Haiku
+# runners, so the build runs inside a Haiku VM on a Linux runner, started by
+# cross-platform-actions. The sync-upstream workflow starts this after each
+# successful sync.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - src/**
+      - cmake/**
+      - "**/CMakeLists.txt"
+      - CMakePresets.json
+      - .github/workflows/haiku.yml
+
+  pull_request:
+    paths:
+      - src/**
+      - cmake/**
+      - "**/CMakeLists.txt"
+      - CMakePresets.json
+      - .github/workflows/haiku.yml
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: haiku-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Qt 6, Release, x86_64
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start Haiku VM
+        uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
+        with:
+          operating_system: haiku
+          architecture: x86-64
+          version: 'r1beta6'
+          memory: 12G
+          cpu_count: 4
+
+      # Haiku activates new packages fully only after a reboot.
+      - name: Install build dependencies
+        shell: cpa.sh {0} --sync-files none --reboot
+        run: |
+          pkgman update -y
+          pkgman install -y cmake ninja pkgconfig \
+            qt6_base_devel qt6_tools_devel libsdl2_devel libsdl3_devel \
+            freetype_devel libpng16_devel zlib_devel zstd_devel openal_devel \
+            libslirp_devel rtmidi_devel fluidsynth2_devel libsndfile_devel mesa_devel
+
+      # The build directory lives outside the synced checkout so that the
+      # object files are never copied back to the runner.
+      # CMAKE_POLICY_VERSION_MINIMUM works around Haiku's OpenALConfig.cmake,
+      # which declares a minimum CMake version that CMake 4 rejects.
+      - name: Configure
+        shell: cpa.sh {0} --sync-files runner-to-vm
+        run: |
+          cmake -S . -B ~/build --preset regular -G Ninja \
+            -D QT=ON -D USE_QT6=ON \
+            -D CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build
+        shell: cpa.sh {0} --sync-files none
+        run: cmake --build ~/build
+
+      - name: Package
+        shell: cpa.sh {0} --sync-files vm-to-runner
+        run: |
+          rm -rf dist
+          mkdir -p dist/86Box
+          cp ~/build/src/86Box dist/86Box/
+          strip dist/86Box/86Box
+          cp COPYING dist/86Box/
+          cat > dist/86Box/README-Haiku.txt << 'EOF'
+          86Box for Haiku R1/beta6 x86_64 (Qt 6)
+
+          Install the libraries it needs:
+
+            pkgman install qt6_base libsdl3 openal libsndfile libslirp rtmidi fluidsynth2 mesa
+
+          Then get the ROM set from https://github.com/86Box/roms and put it in
+          a "roms" folder next to the 86Box binary, or in
+          ~/config/non-packaged/data/86Box/roms.
+          EOF
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: 86Box-Haiku-x86_64-b${{ github.run_number }}
+          path: dist/86Box/
+          if-no-files-found: error

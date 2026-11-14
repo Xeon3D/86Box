@@ -1,5 +1,11 @@
 name: Sync with upstream
 
+# Merges 86Box/86Box master into this fork's master once a day, then starts
+# the Haiku build. Merging goes through GitHub's "sync fork" API because, unlike
+# a git push with the workflow token, it can also bring in upstream changes to
+# .github/workflows. When the merge conflicts, the run fails and its summary
+# lists the conflicting files and how to resolve them by hand.
+
 on:
   schedule:
     - cron: '17 4 * * *'
@@ -7,13 +13,86 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     if: github.repository != '86Box/86Box'
     runs-on: ubuntu-latest
+    env:
+      # A push made with the default workflow token starts no other workflows.
+      # With a personal access token in SYNC_TOKEN the merge itself starts the
+      # push-triggered builds; without one, the Haiku build is started below.
+      HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' }}
     steps:
-      - name: Merge 86Box/86Box master into this fork's master
+      - name: Merge 86Box/86Box master into master
+        id: sync
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
-        run: gh api --method POST "repos/${{ github.repository }}/merge-upstream" -f branch=master
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set +e
+          out=$(gh api --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=master 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          if [ $status -eq 0 ]; then
+            merge_type=$(jq -r '.merge_type' <<<"$out")
+            echo "merge_type=$merge_type"
+            if [ "$merge_type" = none ]; then
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 409' <<<"$out"; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Sync with upstream failed: $out"
+            exit 1
+          fi
+
+      - name: Check out master to find the conflicts
+        if: steps.sync.outputs.conflict == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Report the conflicts
+        if: steps.sync.outputs.conflict == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/86Box/86Box.git
+          git fetch --no-tags upstream master
+          git merge --no-commit --no-ff upstream/master > /dev/null 2>&1 || true
+          conflicts=$(git diff --name-only --diff-filter=U)
+          git merge --abort || true
+          {
+            echo "## Upstream sync stopped: merge conflicts"
+            echo
+            echo "Merging 86Box/86Box master into master conflicts in:"
+            echo
+            for f in $conflicts; do echo "- \`$f\`"; done
+            echo
+            echo "Resolve it locally, push master, then run this workflow again:"
+            echo
+            echo '```'
+            echo 'git fetch upstream'
+            echo 'git checkout master && git pull'
+            echo "git merge upstream/master -m \"Merge branch '86Box:master' into master\""
+            echo '# fix the files above, then: git add <files> && git commit && git push'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream sync has merge conflicts in: $(echo $conflicts)"
+          exit 1
+
+      - name: Start the Haiku build
+        if: steps.sync.outputs.updated == 'true' && env.HAS_SYNC_TOKEN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run haiku.yml --repo "$GITHUB_REPOSITORY" --ref master
