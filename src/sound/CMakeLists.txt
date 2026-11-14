@@ -220,7 +220,7 @@ if(SOUNDCANVAS)
         clap/clap_host.c
     )
     if(NOT WIN32)
-        target_link_libraries(86Box dl)
+        target_link_libraries(86Box ${CMAKE_DL_LIBS})
     endif()
 endif()
 

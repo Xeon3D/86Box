@@ -105,11 +105,6 @@ SoftwareRenderer::paintEvent(QPaintEvent *event)
 void
 SoftwareRenderer::render()
 {
-#ifdef __HAIKU__
-    if (!isExposed())
-        return;
-#endif
-
     QRect rect(0, 0, width(), height());
     m_backingStore->beginPaint(rect);
 
