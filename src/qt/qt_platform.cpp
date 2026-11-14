@@ -156,6 +156,11 @@ extern "C" {
 #include <86box/ui.h>
 #include <86box/runctl.h>
 
+#ifdef __HAIKU__
+/* Haiku's <termios.h>, pulled in by <sys/ioctl.h>, defines CR0 as a
+   delay constant, which clashes with the CR0 member in cpu.h. */
+#    undef CR0
+#endif
 #include "../cpu/cpu.h"
 #include <86box/plat.h>
 

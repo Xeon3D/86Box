@@ -580,10 +580,27 @@ typedef struct {
     size_t         path_len;
     DIR           *find;
     struct dirent *data;
+#    ifdef __HAIKU__
+    /* Haiku's struct dirent ends in a flexible d_name[], so it cannot be
+       embedded here; keep aligned storage big enough for the "." entry. */
+    union {
+        char     bytes[sizeof(struct dirent) + 2];
+        uint64_t align;
+    } base_storage;
+#    else
     struct dirent  base_data;
+#    endif
     struct stat    stats;
     uint8_t        stats_valid;
 } plat_dir_t;
+
+#    ifdef __HAIKU__
+#        define PLAT_DIR_BASE(context) ((struct dirent *) (context)->base_storage.bytes)
+#        define PLAT_DIR_BASE_SIZE     (sizeof(struct dirent) + 2)
+#    else
+#        define PLAT_DIR_BASE(context) (&(context)->base_data)
+#        define PLAT_DIR_BASE_SIZE     sizeof(struct dirent)
+#    endif
 
 /* Static initializer that puts a plat_dir_t in the "no directory open" state.
    Here the directory is held in a DIR * whose unopened sentinel is NULL, so a
@@ -623,9 +640,9 @@ plat_dir_open(plat_dir_t *context, const char *path)
     /* Represent the base directory as a synthetic '.' entry. d_type is left
        DT_UNKNOWN (zeroed by memset) since stats is already valid and all
        plat_dir_is_* macros fall through to the stat path when d_type is unknown. */
-    memset(&context->base_data, 0, sizeof(context->base_data));
-    strcpy(context->base_data.d_name, ".");
-    context->data = &context->base_data;
+    memset(PLAT_DIR_BASE(context), 0, PLAT_DIR_BASE_SIZE);
+    strcpy(PLAT_DIR_BASE(context)->d_name, ".");
+    context->data = PLAT_DIR_BASE(context);
 
     return 1;
 }
@@ -644,8 +661,8 @@ plat_dir_rewind(plat_dir_t *context)
 {
     rewinddir(context->find);
     context->path[context->path_dir_len] = '\0';
-    if (LIKELY(context->data != &context->base_data)) {
-        context->data        = &context->base_data;
+    if (LIKELY(context->data != PLAT_DIR_BASE(context))) {
+        context->data        = PLAT_DIR_BASE(context);
         context->stats_valid = !stat(context->path, &context->stats);
     }
     return 1;
