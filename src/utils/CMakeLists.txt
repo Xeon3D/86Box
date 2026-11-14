@@ -25,10 +25,6 @@ add_library(utils OBJECT
     ini.c
     log.c
     random.c
-
-
-    # Video helpers (NV3)
-    video/video_rop.c
 )
 
 add_library(mdsx_dll OBJECT
