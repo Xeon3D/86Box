@@ -331,6 +331,9 @@ typedef struct {
     uint8_t refcount;
     /*Flags*/
     uint8_t flags;
+    /*Reads in refcount made by uops standing in for a C call that reads
+      nothing: left out where the count decides the block's end or unrolling*/
+    uint8_t uncounted;
     /*uOP that generated this register version*/
     uint16_t parent_uop;
     /*Pointer to next register version in dead register list*/
@@ -384,18 +387,42 @@ codegen_reg_read(int reg)
         fatal("codegen_reg_read - refcount overflow\n");
     else
 #endif
-        if (version->refcount > REG_REFCOUNT_MAX)
+        if ((version->refcount - version->uncounted) > REG_REFCOUNT_MAX)
         CPU_BLOCK_END();
-    if (version->refcount > max_version_refcount)
-        max_version_refcount = version->refcount;
+    if ((version->refcount - version->uncounted) > max_version_refcount)
+        max_version_refcount = version->refcount - version->uncounted;
 #if 0
     pclog("codegen_reg_read: %i %i %i\n", reg & IREG_REG_MASK, ireg.version, reg_version_refcount[IREG_GET_REG(ireg.reg)][ireg.version]);
 #endif
     return ireg;
 }
 
+/*Whether the version of reg the next read gets can take another read
+  without its 8-bit refcount wrapping*/
+static inline int
+codegen_reg_read_has_room(int reg)
+{
+    return reg_version[IREG_GET_REG(reg)][reg_last_version[IREG_GET_REG(reg)]].refcount < 254;
+}
+
+/*The next read of reg stands in for a C call that reads no register: it is
+  left out of the counts that end the block and limit unrolling, which stay
+  as they were with the call*/
+static inline void
+codegen_reg_read_uncounted(int reg)
+{
+    reg_version[IREG_GET_REG(reg)][reg_last_version[IREG_GET_REG(reg)]].uncounted++;
+}
+
 int reg_is_native_size(ir_reg_t ir_reg);
 int ireg_is_byte_accessed(int ireg);
+
+/*The x87 tags the block's code so far has left valid and empty, one bit per
+  IREG_tag0 + n: what holds on every path through it that is still in the
+  block. Forgotten whenever the block may have entered the FPU again
+  (codegen_generate_call), and a tag's bits whenever any uop writes it.*/
+extern uint8_t codegen_fpu_tag_valid;
+extern uint8_t codegen_fpu_tag_empty;
 
 static inline ir_reg_t
 codegen_reg_write(int reg, int uop_nr)
@@ -403,6 +430,11 @@ codegen_reg_write(int reg, int uop_nr)
     ir_reg_t       ireg;
     int            last_version = reg_last_version[IREG_GET_REG(reg)];
     reg_version_t *version;
+
+    if ((unsigned) (IREG_GET_REG(reg) - IREG_tag0) < 8) {
+        codegen_fpu_tag_valid &= ~(1 << (IREG_GET_REG(reg) - IREG_tag0));
+        codegen_fpu_tag_empty &= ~(1 << (IREG_GET_REG(reg) - IREG_tag0));
+    }
 
     if (dirty_ir_regs[(IREG_GET_REG(reg) >> 6) & 3] & (1ull << ((uint64_t)IREG_GET_REG(reg) & 0x3full))) {
         dirty_ir_regs[(IREG_GET_REG(reg) >> 6) & 3] &= ~(1ull << ((uint64_t)IREG_GET_REG(reg) & 0x3full));
@@ -428,6 +460,7 @@ codegen_reg_write(int reg, int uop_nr)
     version             = &reg_version[IREG_GET_REG(reg)][ireg.version];
     version->refcount   = 0;
     version->flags      = 0;
+    version->uncounted  = 0;
     version->parent_uop = uop_nr;
 #if 0
     pclog("codegen_reg_write: %i\n", reg & IREG_REG_MASK);
@@ -457,6 +490,57 @@ void codegen_reg_alloc_register(ir_reg_t dest_reg_a, ir_reg_t src_reg_a, ir_reg_
 #ifdef CODEGEN_BACKEND_HAS_MOV_IMM
 int  codegen_reg_is_loaded(ir_reg_t ir_reg);
 void codegen_reg_write_imm(codeblock_t *block, ir_reg_t ir_reg, uint32_t imm_data);
+#endif
+
+#ifdef CODEGEN_BACKEND_HAS_LAZY_WRITEBACK
+/*At most this many immediates wait for their store at once; one more stores
+  the oldest*/
+#    define CODEGEN_LAZY_PENDING_MAX 8
+#    define CODEGEN_LAZY_STORES_MAX  (CODEGEN_HOST_REGS + CODEGEN_LAZY_PENDING_MAX)
+/*Lazy sites a block may have; past them a site writes back as before*/
+#    define CODEGEN_LAZY_SITES_MAX 256
+/*host_reg for an immediate store*/
+#    define CODEGEN_LAZY_IMM 0xff
+
+typedef struct codegen_lazy_store_t {
+    uint32_t imm;
+    uint8_t  ireg;
+    uint8_t  host_reg;
+} codegen_lazy_store_t;
+
+/*The stores a fault at a lazy site makes before it leaves, in order:
+  the pending immediates, then the dirty registers*/
+typedef struct codegen_lazy_list_t {
+    int                  nr;
+    codegen_lazy_store_t stores[CODEGEN_LAZY_STORES_MAX];
+} codegen_lazy_list_t;
+
+/*The list of the lazy uop being compiled, NULL when it has no stores (its
+  exit is then emitted as for any other uop)*/
+extern codegen_lazy_list_t *codegen_lazy_site;
+
+/*Hold an immediate for a register not in a host register, in place of
+  storing it now*/
+void codegen_reg_defer_imm(codeblock_t *block, ir_reg_t ir_reg, uint32_t imm_data);
+/*codegen_reg_flush for a lazy uop: the integer registers that a fault stub
+  can store stay dirty, and go on its list with the pending immediates*/
+void codegen_reg_flush_lazy(struct ir_data_t *ir, codeblock_t *block);
+/*Emit the stores of list*/
+void codegen_reg_lazy_stores(codeblock_t *block, const codegen_lazy_list_t *list);
+#endif
+
+#ifdef CODEGEN_BACKEND_HAS_COLD_REGION
+/*Keep the allocator's state at a branch over a cold region*/
+void codegen_reg_cold_snapshot(void);
+/*Take it back at the region's destination*/
+void codegen_reg_cold_restore(void);
+/*Before the branch over a region that goes on: ireg, which it writes, out of
+  the host registers and the held immediates*/
+void codegen_reg_cold_drop(codeblock_t *block, int ireg);
+/*Whether what the allocator holds can be loaded again after a call*/
+int codegen_reg_cold_can_rejoin(void);
+/*At the end of a region that goes on: load what the copy holds, take it back*/
+void codegen_reg_cold_rejoin(codeblock_t *block);
 #endif
 
 ir_host_reg_t codegen_reg_alloc_read_reg(codeblock_t *block, ir_reg_t ir_reg, int *host_reg_idx);

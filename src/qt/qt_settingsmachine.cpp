@@ -178,6 +178,8 @@ SettingsMachine::SettingsMachine(QWidget *parent)
     ui->radioButtonLargerFrames->setChecked(force_10ms);
     ui->radioButtonSmallerFrames->setChecked(!force_10ms);
 
+    ui->checkBoxFastForwardOnStart->setChecked(fast_forward_on_start);
+
     ui->checkBoxOverrideInterpreter->setChecked(cpu_override_interpreter ? true : false);
     ui->checkBoxDebugRegs486->setChecked(cpu_debug_regs_486 ? true : false);
 
@@ -252,7 +254,11 @@ SettingsMachine::changed()
     has_changed |= (time_fixed_year   != fixed_year);
     has_changed |= (time_keep_date    != keep_date);
 
-    return has_changed ? (SETTINGS_CHANGED | SETTINGS_REQUIRE_HARD_RESET) : 0;
+    /* Only takes effect the next time the machine is started */
+    const int soft_changed = (fast_forward_on_start != (ui->checkBoxFastForwardOnStart->isChecked() ? 1 : 0));
+
+    return has_changed ? (SETTINGS_CHANGED | SETTINGS_REQUIRE_HARD_RESET) :
+                         (soft_changed ? SETTINGS_CHANGED : 0);
 }
 
 void
@@ -269,6 +275,8 @@ SettingsMachine::currentMachineId() const
 void
 SettingsMachine::save(int soft)
 {
+    fast_forward_on_start = ui->checkBoxFastForwardOnStart->isChecked() ? 1 : 0;
+
     if (soft)
         return;
 
@@ -499,18 +507,24 @@ SettingsMachine::on_comboBoxSpeed_currentIndexChanged(int index)
             ui->checkBoxOverrideInterpreter->setEnabled(true);
 
         // win_settings_machine_recalc_fpu
-        auto *modelFpu   = ui->comboBoxFPU->model();
-        int   removeRows = modelFpu->rowCount();
+        // A board without an FPU socket only offers the CPU's own FPU.
+        bool  noFpuSocket = machine_has_flags(machineId, MACHINE_NO_FPU_SOCKET);
+        auto *modelFpu    = ui->comboBoxFPU->model();
+        int   removeRows  = modelFpu->rowCount();
 
         int i              = 0;
+        int row            = 0;
         int selectedFpuRow = 0;
         Models::Batch fpuRows(modelFpu);
         for (const char *fpuName         = fpu_get_name_from_index(cpuFamily, cpuId, i);
              fpuName != nullptr; fpuName = fpu_get_name_from_index(cpuFamily, cpuId, ++i)) {
             auto fpuType = fpu_get_type_from_index(cpuFamily, cpuId, i);
+            if (noFpuSocket && (fpuType != FPU_NONE) && (fpuType != FPU_INTERNAL))
+                continue;
             fpuRows.add(tr(fpuName), fpuType);
             if (fpu_type == fpuType)
-                selectedFpuRow = i;
+                selectedFpuRow = row;
+            row++;
         }
 
         fpuRows.commit();
@@ -525,12 +539,11 @@ void
 SettingsMachine::on_comboBoxFPU_currentIndexChanged(int index)
 {
     if (index >= 0) {
-        int         cpuFamilyId = ui->comboBoxCPU->currentData().toInt();
-        const auto *cpuFamily   = &cpu_families[cpuFamilyId];
-        int         cpuId       = ui->comboBoxSpeed->currentData().toInt();
-        int         machineId   = ui->comboBoxMachine->currentData().toInt();
+        int machineId = ui->comboBoxMachine->currentData().toInt();
 
-        if (fpu_get_type_from_index(cpuFamily, cpuId, index) == FPU_NONE) {
+        /* The FPU list can be filtered (a board without an FPU socket), so the
+           type comes from the item data rather than from the raw CPU index. */
+        if (ui->comboBoxFPU->currentData().toInt() == FPU_NONE) {
             ui->checkBoxFPUSoftfloat->setChecked(false);
             ui->checkBoxFPUSoftfloat->setEnabled(false);
         } else {

@@ -63,10 +63,10 @@ io_t   *io_last[NPORTS];
 uint8_t io_turbo_map[NPORTS >> 3];
 int io_turbo_throttle = 0;
 
-/* Chipset claims (io_set_claim). Only a few ports are ever claimed, so they
-   live in a small table, and a bitmap of claimed ports lets every other
-   port skip the table lookup. */
-#define IO_CLAIMS 8
+/* Chipset claims (io_set_claim). Only a few ports are ever claimed (the
+   CS5530's DMA traps are the most, 48), so they live in a small table, and
+   a bitmap of claimed ports lets every other port skip the table lookup. */
+#define IO_CLAIMS 64
 
 typedef struct io_claim_t {
     uint16_t port;
@@ -413,6 +413,10 @@ inb(uint16_t port)
 #endif
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 1;
+    io_write = 0;
 
     if (cpu_dr_armed)
         io_debug_check_addr(port);
@@ -455,7 +459,9 @@ inb(uint16_t port)
             amstrad_latch = AMSTRAD_SW9 | 0x80000000;
     }
 
-    if (!found || (machines[machine].init == machine_xt_ibm5550_init) || (machines[machine].init == machine_xt_ibm5535_init))
+    if (!found ||
+        (machines[machine].init == machine_xt_ibm5550_init) ||
+        (machines[machine].init == machine_xt_ibm5535_init))
         cycles -= io_delay;
 
     /* TriGem 486-BIOS MHz output. */
@@ -464,6 +470,7 @@ inb(uint16_t port)
         ret = 0xfe;
 #endif
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) in b(%04X) = %02X\n", CS, cpu_state.pc, in_smm, found, qfound, port, ret);
 
     if ((port & 0xfff8) == 0x0200)
@@ -483,6 +490,10 @@ outb(uint16_t port, uint8_t val)
 #endif
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 1;
+    io_write = 1;
     io_val  = val;
 
     if (cpu_dr_armed)
@@ -525,6 +536,7 @@ outb(uint16_t port, uint8_t val)
 #endif
     }
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) outb(%04X, %02X)\n", CS, cpu_state.pc, in_smm, found, qfound, port, val);
 
     if ((port & 0xfff8) == 0x0200)
@@ -544,6 +556,10 @@ inw(uint16_t port)
     uint8_t  ret8[2];
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 2;
+    io_write = 0;
 
     if (cpu_dr_armed)
         io_debug_check_addr(port);
@@ -606,9 +622,17 @@ inw(uint16_t port)
             amstrad_latch = AMSTRAD_SW9 | 0x80000000;
     }
 
-    if (!found || (machines[machine].init == machine_xt_ibm5550_init) || (machines[machine].init == machine_xt_ibm5535_init))
-        cycles -= io_delay;
+    if (!found || (port == 0x84) ||
+        (machines[machine].init == machine_xt_ibm5550_init) ||
+        (machines[machine].init == machine_xt_ibm5535_init)) {
+        cycles -= (io_delay * (io_delay_multi ? 2 : 1));
+#ifdef USE_DYNAREC
+        if (cpu_use_dynarec && (port == 0x84))
+            update_tsc();
+#endif
+    }
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) in w(%04X) = %04X\n", CS, cpu_state.pc, in_smm, found, qfound, port, ret);
 
     if ((port & 0xfff8) == 0x0200)
@@ -628,6 +652,10 @@ outw(uint16_t port, uint16_t val)
 #endif
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 2;
+    io_write = 1;
     io_val  = val;
 
     if (cpu_dr_armed)
@@ -680,13 +708,14 @@ outw(uint16_t port, uint16_t val)
     }
 
     if (!found) {
-        cycles -= io_delay;
+        cycles -= (io_delay * (io_delay_multi ? 2 : 1));
 #ifdef USE_DYNAREC
         if (cpu_use_dynarec && ((port == 0xeb) || (port == 0xed)))
             update_tsc();
 #endif
     }
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) outw(%04X, %04X)\n", CS, cpu_state.pc, in_smm, found, qfound, port, val);
 
     if ((port & 0xfff8) == 0x0200)
@@ -707,6 +736,10 @@ inl(uint16_t port)
 #endif
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 4;
+    io_write = 0;
 
     if (cpu_dr_armed)
         io_debug_check_addr(port);
@@ -800,9 +833,12 @@ inl(uint16_t port)
             amstrad_latch = AMSTRAD_SW9 | 0x80000000;
     }
 
-    if (!found || (machines[machine].init == machine_xt_ibm5550_init) || (machines[machine].init == machine_xt_ibm5535_init))
-        cycles -= io_delay;
+    if (!found ||
+        (machines[machine].init == machine_xt_ibm5550_init) ||
+        (machines[machine].init == machine_xt_ibm5535_init))
+        cycles -= (io_delay * (io_delay_multi ? 4 : 1));
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) in l(%04X) = %08X\n", CS, cpu_state.pc, in_smm, found, qfound, port, ret);
 
     if ((port & 0xfff8) == 0x0200)
@@ -822,6 +858,10 @@ outl(uint16_t port, uint32_t val)
 #endif
 
     io_port = port;
+    io_cycle = 1;
+    io_cycle_smi = 0;
+    io_size = 4;
+    io_write = 1;
     io_val  = val;
 
     if (cpu_dr_armed)
@@ -891,13 +931,14 @@ outl(uint16_t port, uint32_t val)
     }
 
     if (!found) {
-        cycles -= io_delay;
+        cycles -= (io_delay * (io_delay_multi ? 4 : 1));
 #ifdef USE_DYNAREC
         if (cpu_use_dynarec && ((port == 0xeb) || (port == 0xed)))
             update_tsc();
 #endif
     }
 
+    io_cycle = 0;
     io_log("[%04X:%08X] (%i, %i, %04i) outl(%04X, %08X)\n", CS, cpu_state.pc, in_smm, found, qfound, port, val);
 
     if ((port & 0xfff8) == 0x0200)
@@ -968,6 +1009,11 @@ io_trap_remap(void *handle, uint8_t enable, uint16_t port, uint16_t size)
 {
     io_trap_t *trap = (io_trap_t *) handle;
     if (!trap)
+        return;
+
+    /* Nothing to do if the mapping is unchanged; chipsets recalculate their
+       traps on every power management register write. */
+    if ((trap->enable == !!enable) && (!enable || ((trap->base == port) && (trap->size == size))))
         return;
 
     io_log("I/O: Remapping trap from %04X-%04X (enable %d) to %04X-%04X (enable %d)\n",

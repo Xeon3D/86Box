@@ -25,8 +25,12 @@
 
 #include "qt_specifydimensions.h"
 #include "qt_soundgain.hpp"
+#include "qt_models_common.hpp"
 #include "qt_preferences.hpp"
 #include "qt_mcadevicelist.hpp"
+#include "qt_memoryviewer.hpp"
+
+#include <QPointer>
 
 #include "qt_rendererstack.hpp"
 #include "qt_renderercommon.hpp"
@@ -37,11 +41,13 @@
 
 extern "C" {
 #include <86box/86box.h>
+#include <86box/ini.h>
 #include <86box/config.h>
+#include <86box/device.h>
 #include <86box/keyboard.h>
 #include <86box/plat.h>
 #include <86box/ui.h>
-#include <86box/device.h>
+#include <86box/runctl.h>
 #include <86box/video.h>
 #include <86box/mouse.h>
 #include <86box/machine.h>
@@ -52,6 +58,10 @@ extern "C" {
 #include <86box/nvr.h>
 #include <86box/acpi.h>
 #include <86box/renderdefs.h>
+#include <86box/midi.h>
+#ifdef USE_RTMIDI
+#    include <86box/midi_rtmidi.h>
+#endif
 
 #ifdef USE_VNC
 #    include <86box/vnc.h>
@@ -67,7 +77,6 @@ extern int qt_nvr_save(void);
 extern void nmi_raise(void);
 
 extern bool cpu_thread_running;
-extern bool fast_forward;
 };
 
 #include <QGuiApplication>
@@ -99,6 +108,7 @@ extern bool fast_forward;
 void qt_set_sequence_auto_mnemonic(bool b);
 
 #include <array>
+#include <utility>
 #include <memory>
 #include <unordered_map>
 
@@ -169,7 +179,7 @@ keyb_filter(BMessage *message, BHandler **target, BMessageFilter *filter)
 static BMessageFilter *filter;
 #endif
 
-extern int cpu_force_interpreter;
+#include <86box/cpu_events.h>
 
 extern void     qt_mouse_capture(int);
 extern "C" void qt_blit(int x, int y, int w, int h, int monitor_index);
@@ -214,6 +224,29 @@ MainWindow::MainWindow(QWidget *parent)
     main_window = this;
     ui->setupUi(this);
     status->setSoundMenu(ui->menuSound);
+    midiOutGroup = new QActionGroup(this);
+    midiOutGroup->setExclusive(true);
+    connect(ui->menuMIDI, &QMenu::aboutToShow, this, &MainWindow::refreshMidiOutMenu);
+    connect(ui->menuSound, &QMenu::aboutToShow, this, [this] {
+        ui->menuMIDI_command->setEnabled(midi_out_device_is_open());
+    });
+    const std::pair<QAction *, int> midiCommands[] = {
+        { ui->actionMIDI_reset_GM,      MIDI_CMD_GM_ON         },
+        { ui->actionMIDI_reset_GS,      MIDI_CMD_GS_RESET      },
+        { ui->actionMIDI_reset_XG,      MIDI_CMD_XG_ON         },
+        { ui->actionMIDI_reset_MT32,    MIDI_CMD_MT32_RESET    },
+        { ui->actionMIDI_all_notes_off, MIDI_CMD_ALL_NOTES_OFF }
+    };
+    for (const auto &[action, cmd] : midiCommands) {
+        connect(action, &QAction::triggered, this, [cmd] {
+            runctl_pause_wait(RUN_PAUSE_SYNC);
+            midi_out_send_command(cmd);
+            runctl_resume(RUN_PAUSE_SYNC);
+        });
+    }
+    connect(ui->actionMIDI_restart_device, &QAction::triggered, this, [this] {
+        switchMidiOut(midi_output_device_current);
+    });
     dynarecMenu = new QMenu(this);
     dynarecMenu->addAction(ui->actionForce_interpretation);
     status->setDynarecMenu(dynarecMenu);
@@ -347,9 +380,7 @@ MainWindow::MainWindow(QWidget *parent)
         num_label->setVisible(machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD));
         scroll_label->setVisible(machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD));
         caps_label->setVisible(machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD));
-        int ext_ax_kbd = machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD) && (keyboard_type == KEYBOARD_TYPE_AX);
-        int int_ax_kbd = machine_has_flags(machine, MACHINE_KEYBOARD_AX) && !machine_has_bus(machine, MACHINE_BUS_PS2_PORTS);
-        kana_label->setVisible(ext_ax_kbd || int_ax_kbd);
+        kana_label->setVisible(hasKanaLock());
 
         ui->actionMouse->setEnabled(true);
         ui->actionTablet->setEnabled(true);
@@ -460,21 +491,25 @@ MainWindow::MainWindow(QWidget *parent)
 
     connect(qApp, &QGuiApplication::applicationStateChanged, [this](Qt::ApplicationState state) {
         if (state == Qt::ApplicationState::ApplicationActive) {
-            if (auto_paused) {
-                plat_pause(0);
-                auto_paused = 0;
-            }
+            runctl_resume(RUN_PAUSE_FOCUS);
         } else {
             if (mouse_capture)
                 emit setMouseCapture(false);
 
             keyboard_all_up();
 
-            if (do_auto_pause && !dopause) {
-                auto_paused = 1;
-                plat_pause(1);
-            }
+            if (do_auto_pause)
+                runctl_pause(RUN_PAUSE_FOCUS);
         }
+    });
+
+    /* Keys go to the guest only while the main window or a renderer is
+       active (keyReleaseEvent), so one held down as another of our windows
+       takes over, such as the memory viewer stopping at a breakpoint, would
+       never be released. Leaving the application is handled above. */
+    connect(qApp, &QGuiApplication::focusWindowChanged, this, [this](QWindow *window) {
+        if (window && !isMainWindowOrRendererActive())
+            keyboard_all_up();
     });
 
     connect(this, &MainWindow::resizeContents, this, [this](int w, int h) {
@@ -492,14 +527,21 @@ MainWindow::MainWindow(QWidget *parent)
             ui->toolBar->show();
         }
         if (!QApplication::platformName().contains("eglfs") && vid_resize != 1) {
-            w = static_cast<int>(w / (!dpi_scale ? util::screenOfWidget(this)->devicePixelRatio() : 1.));
+            /* Without HiDPI scaling the size is in device pixels. The window may come out
+               a pixel larger than that, and the renderer then draws the picture without
+               stretching it to fill the extra pixel. */
+            if (!dpi_scale) {
+                const qreal dpr = util::screenOfWidget(this)->devicePixelRatio();
+                w = util::logicalSizeForPixels(w, dpr);
+                h = util::logicalSizeForPixels(h, dpr);
+            }
 
-            const int modifiedHeight = static_cast<int>(h / (!dpi_scale ? util::screenOfWidget(this)->devicePixelRatio() : 1.))
+            const int modifiedHeight = h
                 + menuBar()->height()
                 + (statusBar()->height() * !hide_status_bar)
                 + (ui->toolBar->height() * !hide_tool_bar);
 
-            ui->stackedWidget->resize(w, static_cast<int>(h / (!dpi_scale ? util::screenOfWidget(this)->devicePixelRatio() : 1.)));
+            ui->stackedWidget->resize(w, h);
             setFixedSize(w, modifiedHeight);
         }
     });
@@ -509,11 +551,13 @@ MainWindow::MainWindow(QWidget *parent)
 #ifdef QT_RESIZE_DEBUG
             qDebug() << "Resize";
 #endif
-            w = static_cast<int>(w / (!dpi_scale ? util::screenOfWidget(renderers[monitor_index].get())->devicePixelRatio() : 1.));
+            if (!dpi_scale) {
+                const qreal dpr = util::screenOfWidget(renderers[monitor_index].get())->devicePixelRatio();
+                w = util::logicalSizeForPixels(w, dpr);
+                h = util::logicalSizeForPixels(h, dpr);
+            }
 
-            int modifiedHeight = static_cast<int>(h / (!dpi_scale ? util::screenOfWidget(renderers[monitor_index].get())->devicePixelRatio() : 1.));
-
-            renderers[monitor_index]->setFixedSize(w, modifiedHeight);
+            renderers[monitor_index]->setFixedSize(w, h);
         }
     });
 
@@ -524,9 +568,6 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
 
-    connect(this, &MainWindow::updateStatusBarPanes, this, [this] {
-        refreshMediaMenu();
-    });
     connect(this, &MainWindow::updateStatusBarPanes, this, &MainWindow::refreshMediaMenu);
     connect(this, &MainWindow::updateStatusBarTip, status.get(), &MachineStatus::updateTip);
     connect(this, &MainWindow::statusBarMessage, status.get(), &MachineStatus::message, Qt::QueuedConnection);
@@ -541,6 +582,7 @@ MainWindow::MainWindow(QWidget *parent)
     ui->actionHide_tool_bar->setChecked(hide_tool_bar);
     ui->actionShow_non_primary_monitors->setChecked(show_second_monitors);
     ui->actionUpdate_status_bar_icons->setChecked(update_icons);
+    ui->actionFast_forward_on_start->setChecked(fast_forward_on_start);
     ui->actionApply_fullscreen_stretch_mode_when_maximized->setChecked(video_fullscreen_scale_maximized);
 
 #ifdef Q_OS_MACOS
@@ -773,6 +815,9 @@ MainWindow::MainWindow(QWidget *parent)
         case FULLSCR_SCALE_CENTER43:
             ui->actionFullScreen_center43->setChecked(true);
             break;
+        case FULLSCR_SCALE_INT43_VERT:
+            ui->actionFullScreen_int43_vert->setChecked(true);
+            break;
     }
 
     actGroup = new QActionGroup(this);
@@ -811,6 +856,7 @@ MainWindow::MainWindow(QWidget *parent)
     actGroup->addAction(ui->actionFullScreen_int43);
     actGroup->addAction(ui->actionFullScreen_center);
     actGroup->addAction(ui->actionFullScreen_center43);
+    actGroup->addAction(ui->actionFullScreen_int43_vert);
     switch (video_gl_input_scale_mode) {
         default:
             break;
@@ -901,12 +947,6 @@ MainWindow::MainWindow(QWidget *parent)
 #endif
 
     setContextMenuPolicy(Qt::PreventContextMenu);
-    /* Remove default Shift+F10 handler, which unfocuses keyboard input even with no context menu. */
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    connect(new QShortcut(QKeySequence(Qt::SHIFT | Qt::Key_F10), this), &QShortcut::activated, this, []() { });
-#else
-    connect(new QShortcut(QKeySequence(Qt::SHIFT + Qt::Key_F10), this), &QShortcut::activated, this, []() { });
-#endif
 
     connect(this, &MainWindow::initRendererMonitor, this, &MainWindow::initRendererMonitorSlot);
     connect(this, &MainWindow::initRendererMonitorForNonQtThread, this, &MainWindow::initRendererMonitorSlot, Qt::BlockingQueuedConnection);
@@ -1049,7 +1089,7 @@ MainWindow::closeEvent(QCloseEvent *event)
     }
 
     qt_nvr_save();
-    cpu_thread_run = 0;
+    runctl_request_stop();
     event->accept();
 }
 
@@ -1360,7 +1400,7 @@ MainWindow::on_actionNon_maskable_interrupt_triggered()
 void
 MainWindow::on_actionPause_triggered()
 {
-    plat_pause(dopause ^ 1);
+    runctl_pause_user_toggle();
 }
 
 void
@@ -1391,8 +1431,7 @@ MainWindow::setVmmSupervised(bool supervised)
 void
 MainWindow::on_actionSettings_triggered()
 {
-    const int currentPause = dopause;
-    plat_pause(1);
+    runctl_pause_wait(RUN_PAUSE_SYNC);
     Settings settings(this);
     settings.setModal(true);
     settings.setWindowModality(Qt::WindowModal);
@@ -1421,7 +1460,9 @@ MainWindow::on_actionSettings_triggered()
         case QDialog::Rejected:
             break;
     }
-    plat_pause(currentPause);
+    /* Also changed by soft saves, which reject the dialog */
+    ui->actionFast_forward_on_start->setChecked(fast_forward_on_start);
+    runctl_resume(RUN_PAUSE_SYNC);
 }
 
 void
@@ -1697,6 +1738,25 @@ MainWindow::keyMatchesAccelerator(const QKeyEvent *ke, const char *name)
 bool
 MainWindow::eventFilter(QObject *receiver, QEvent *event)
 {
+    /* Keys typed into the memory viewer are its own, not the guest's. */
+    if ((event->type() == QEvent::KeyPress) || (event->type() == QEvent::KeyRelease) || (event->type() == QEvent::ShortcutOverride)) {
+        auto *widget = qobject_cast<QWidget *>(receiver);
+        if (widget && qobject_cast<MemoryViewer *>(widget->window()))
+            return QMainWindow::eventFilter(receiver, event);
+    }
+
+    /* Suppress Qt's default Shift-F10 so the combination still
+       reaches the guest. */
+    if (event->type() == QEvent::ShortcutOverride) {
+        auto *ke = static_cast<QKeyEvent *>(event);
+        if (ke->key() == Qt::Key_F10
+            && (ke->modifiers() & Qt::ShiftModifier)
+            && !(ke->modifiers() & ~Qt::ShiftModifier)) {
+            event->accept();
+            return true;
+        }
+    }
+
     if (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease) {
         auto      *ke   = static_cast<QKeyEvent *>(event);
         const bool down = event->type() == QEvent::KeyPress;
@@ -1792,7 +1852,7 @@ MainWindow::eventFilter(QObject *receiver, QEvent *event)
         }
     }
 
-    if (!main_window_blocked && !dopause && (!kbd_req_capture || mouse_capture)) {
+    if (!main_window_blocked && !dopause && (!kbd_req_capture || mouse_capture) && isMainWindowOrRendererActive()) {
 #if 0
         if (event->type() == QEvent::Shortcut) {
             auto shortcutEvent = (QShortcutEvent *) event;
@@ -1815,24 +1875,20 @@ MainWindow::eventFilter(QObject *receiver, QEvent *event)
     }
 
     if (receiver == this) {
-        static auto curdopause = dopause;
         if (event->type() == QEvent::WindowBlocked) {
             if (qt_osd_is_visible())
                 qt_osd_toggle();
             window_blocked     = true;
             mouse_was_captured = (mouse_capture != 0);
-            if (do_auto_dialog_pause > 0) {
-                curdopause = dopause;
-                plat_pause(isNonPause ? dopause : (isShowMessage ? 2 : 1));
-            }
+            if ((do_auto_dialog_pause > 0) && !isNonPause)
+                runctl_pause(RUN_PAUSE_DIALOG);
             if (mouse_was_captured)
                 plat_mouse_capture(0);
             releaseKeyboard();
             main_window_blocked = 1;
         } else if (event->type() == QEvent::WindowUnblocked) {
             window_blocked = false;
-            if (do_auto_dialog_pause > 0)
-                plat_pause(curdopause);
+            runctl_resume(RUN_PAUSE_DIALOG);
             if (mouse_was_captured) {
                 plat_mouse_capture(1);
             }
@@ -1864,9 +1920,7 @@ MainWindow::refreshMediaMenu()
     caps_label->setToolTip(QShortcut::tr("Caps Lock"));
     caps_label->setVisible(machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD));
     kana_label->setToolTip(QShortcut::tr("Kana Lock"));
-    int ext_ax_kbd = machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD) && (keyboard_type == KEYBOARD_TYPE_AX);
-    int int_ax_kbd = machine_has_flags(machine, MACHINE_KEYBOARD_AX) && !machine_has_bus(machine, MACHINE_BUS_PS2_PORTS);
-    kana_label->setVisible(ext_ax_kbd || int_ax_kbd);
+    kana_label->setVisible(hasKanaLock());
 
     bool enable_comp_option = false;
     for (int i = 0; i < MONITORS_NUM; i++) {
@@ -1878,6 +1932,18 @@ MainWindow::refreshMediaMenu()
 
     ui->actionCGA_composite_settings->setEnabled(enable_comp_option);
     refreshDisplayRatioActions();
+}
+
+/* Only the AX keyboard has a Kana Lock key. A machine that ships one has the
+   indicator whatever the bus, any other machine has it while an AX keyboard
+   is selected on a keyboard port. */
+bool
+MainWindow::hasKanaLock()
+{
+    if (machine_get_kbd_device(machine) == &keyboard_ax_device)
+        return true;
+
+    return machine_has_bus(machine, MACHINE_BUS_PS2_PORTS | MACHINE_BUS_AT_KBD) && (keyboard_type == KEYBOARD_TYPE_AX);
 }
 
 /* Labels the power off action, which only asks for confirmation without ACPI. */
@@ -1934,7 +2000,6 @@ MainWindow::showMessage_(int flags, const QString &header, const QString &messag
     if (done) {
         *done = false;
     }
-    isShowMessage = true;
 
     auto defaultheader = QString();
     if (header.isEmpty()) {
@@ -1958,7 +2023,6 @@ MainWindow::showMessage_(int flags, const QString &header, const QString &messag
     if (done) {
         *done = true;
     }
-    isShowMessage = false;
     if (cpu_thread_run == 0)
         QApplication::exit(-1);
 }
@@ -1966,6 +2030,8 @@ MainWindow::showMessage_(int flags, const QString &header, const QString &messag
 void
 MainWindow::keyPressEvent(QKeyEvent *event)
 {
+    if (!isMainWindowOrRendererActive())
+        return;
     if (send_keyboard_input) {
 #ifdef Q_OS_MACOS
         processMacKeyboardInput(true, event);
@@ -1975,6 +2041,20 @@ MainWindow::keyPressEvent(QKeyEvent *event)
     }
 
     event->accept();
+}
+
+bool
+MainWindow::isMainWindowOrRendererActive() const
+{
+    if (QMainWindow::isActiveWindow())
+        return true;
+
+    for (const auto &renderer : renderers) {
+        if (renderer && renderer->isActiveWindow())
+            return true;
+    }
+
+    return false;
 }
 
 void
@@ -1992,9 +2072,11 @@ MainWindow::blitToWidget(int x, int y, int w, int h, int monitor_index)
 void
 MainWindow::keyReleaseEvent(QKeyEvent *event)
 {
+    if (!isMainWindowOrRendererActive())
+        return;
     if (event->key() == Qt::Key_Pause) {
         if (keyboard_recv_ui(0x38) && keyboard_recv_ui(0x138)) {
-            plat_pause(dopause ^ 1);
+            runctl_pause_user_toggle();
         }
     }
 
@@ -2207,6 +2289,7 @@ update_fullscreen_scale_checkboxes(Ui::MainWindow *ui, QAction *selected)
     ui->actionFullScreen_int43->setChecked(selected == ui->actionFullScreen_int43);
     ui->actionFullScreen_center->setChecked(selected == ui->actionFullScreen_center);
     ui->actionFullScreen_center43->setChecked(selected == ui->actionFullScreen_center43);
+    ui->actionFullScreen_int43_vert->setChecked(selected == ui->actionFullScreen_int43_vert);
 
     {
         auto widget = ui->stackedWidget->currentWidget();
@@ -2270,6 +2353,13 @@ MainWindow::on_actionFullScreen_center43_triggered()
 {
     video_fullscreen_scale = FULLSCR_SCALE_CENTER43;
     update_fullscreen_scale_checkboxes(ui, ui->actionFullScreen_center43);
+}
+
+void
+MainWindow::on_actionFullScreen_int43_vert_triggered()
+{
+    video_fullscreen_scale = FULLSCR_SCALE_INT43_VERT;
+    update_fullscreen_scale_checkboxes(ui, ui->actionFullScreen_int43_vert);
 }
 
 void
@@ -2343,7 +2433,15 @@ MainWindow::on_actionUpdate_mouse_every_CPU_frame_triggered()
 void
 MainWindow::on_actionFast_forward_triggered()
 {
-    fast_forward ^= 1;
+    runctl_fast_forward_toggle();
+}
+
+void
+MainWindow::on_actionFast_forward_on_start_triggered()
+{
+    fast_forward_on_start ^= 1;
+    ui->actionFast_forward_on_start->setChecked(fast_forward_on_start);
+    config_save();
 }
 
 void
@@ -2532,6 +2630,111 @@ MainWindow::on_actionSound_gain_triggered()
     gain.exec();
 }
 
+/* The list is built each time the menu opens, as the settings may have
+   changed the device. Models::Devices() keeps the table until the settings
+   dialog closes, so the devices that have to look for files (ROMs, CLAP
+   plugins) are not checked again on every opening. */
+void
+MainWindow::refreshMidiOutMenu()
+{
+    for (QAction *action : midiOutGroup->actions())
+        delete action;
+
+    /* The devices go above the separator and "Restart device" from the .ui. */
+    QAction   *first      = ui->menuMIDI->actions().value(0);
+    const bool systemMidi = !strcmp(midi_out_device_get_internal_name(midi_output_device_current),
+                                    SYSTEM_MIDI_INTERNAL_NAME);
+    QAction   *none       = nullptr;
+    bool       listed     = false;
+
+    const auto addEntry = [&](const QString &name, int device, int port, bool current) {
+        auto *action = new QAction(name, ui->menuMIDI);
+        ui->menuMIDI->insertAction(first, action);
+        action->setCheckable(true);
+        action->setChecked(current);
+        midiOutGroup->addAction(action);
+        connect(action, &QAction::triggered, this, [this, device, port, current] {
+            if (!current)
+                switchMidiOut(device, port);
+        });
+        listed |= current;
+        return action;
+    };
+
+    /* The emulation sends to an open System MIDI port from its own thread,
+       through the RtMidi object that also lists the host's ports. */
+    if (systemMidi)
+        runctl_pause_wait(RUN_PAUSE_SYNC);
+
+    for (const auto &midi : Models::Devices(midi_out_device_getdevice, midi_out_device_get_internal_name,
+                                            midi_out_device_available, 0)) {
+        if (!midi.available)
+            continue;
+
+        const bool current = (midi.id == midi_output_device_current);
+#ifdef USE_RTMIDI
+        /* One entry for each port of the host, as the device's settings
+           list them. RtMidi opens the first port when the configured one
+           is gone. */
+        if (!strcmp(midi_out_device_get_internal_name(midi.id), SYSTEM_MIDI_INTERNAL_NAME)) {
+            const int ports = rtmidi_out_get_num_devs();
+            int       port  = config_get_int(SYSTEM_MIDI_NAME, "midi", 0);
+
+            if ((port < 0) || (port >= ports))
+                port = 0;
+            for (int i = 0; i < ports; i++) {
+                char name[512] = { 0 };
+
+                rtmidi_out_get_dev_name(i, name);
+                addEntry(QString("%1: %2").arg(midi.name, QString::fromUtf8(name).simplified()),
+                         midi.id, i, current && (i == port));
+            }
+            continue;
+        }
+#endif
+        QAction *action = addEntry(midi.name, midi.id, -1, current);
+        if (midi.id == 0)
+            none = action;
+    }
+
+    if (systemMidi)
+        runctl_resume(RUN_PAUSE_SYNC);
+
+    /* As in the settings, a configured device that can't be used, for
+       example with its plugin missing, shows as None. */
+    if (!listed && none)
+        none->setChecked(true);
+
+    /* System MIDI only reopens the host's port: a module on the other end
+       doesn't restart. */
+    ui->actionMIDI_restart_device->setEnabled(listed && (midi_output_device_current > 0) && !systemMidi);
+}
+
+/* Like plugging a module into the MIDI port, or switching it off and on
+   again when it's the same device: it starts from its power-on state, while
+   the rest of the machine keeps running. A System MIDI port is chosen with
+   port 0 and up. */
+void
+MainWindow::switchMidiOut(int device, int port)
+{
+    bool changed = (device != midi_output_device_current);
+
+    if (port >= 0)
+        changed |= (port != config_get_int(SYSTEM_MIDI_NAME, "midi", 0));
+
+    runctl_pause_wait(RUN_PAUSE_SYNC);
+    midi_output_device_current = device;
+    if (port >= 0)
+        config_set_int(SYSTEM_MIDI_NAME, "midi", port);
+    midi_config_changed();
+    if (changed)
+        config_save();
+    runctl_resume(RUN_PAUSE_SYNC);
+
+    if (changed)
+        emitVmmSignal();
+}
+
 void
 MainWindow::setSendKeyboardInput(bool enabled)
 {
@@ -2550,11 +2753,14 @@ MainWindow::updateUiPauseState()
     emit vmmRunningStateChanged(static_cast<VMManagerProtocol::RunningState>(window_blocked ? (dopause ? VMManagerProtocol::RunningState::PausedWaiting : VMManagerProtocol::RunningState::RunningWaiting) : (VMManagerProtocol::RunningState) dopause));
 }
 
-/* The menu's check follows fast forward set from elsewhere (automation). */
+/* Fast forward can be set from the menu, the accelerator or automation;
+   the check and the muted sound icon follow runctl. */
 void
 MainWindow::updateUiFastForwardState()
 {
-    ui->actionFast_forward->setChecked(fast_forward);
+    ui->actionFast_forward->setChecked(runctl_mode() == RUN_MODE_FAST);
+    if (status)
+        status->updateSoundIcon();
 }
 
 void
@@ -2728,6 +2934,20 @@ MainWindow::on_actionMCA_devices_triggered()
 }
 
 void
+MainWindow::on_actionMemory_viewer_triggered()
+{
+    /* One viewer at a time: it owns the debugger while it is open. */
+    static QPointer<MemoryViewer> viewer;
+
+    if (!viewer) {
+        viewer = new MemoryViewer(this);
+        viewer->show();
+    }
+    viewer->raise();
+    viewer->activateWindow();
+}
+
+void
 MainWindow::on_actionShow_non_primary_monitors_triggered()
 {
     show_second_monitors = static_cast<int>(ui->actionShow_non_primary_monitors->isChecked());
@@ -2843,10 +3063,7 @@ MainWindow::on_actionACPI_Shutdown_triggered()
     }
 
     if (device_has_power_button()) {
-        const int was_paused = dopause;
-        plat_pause(1); /* Wait for CPU acknowledgement before changing device state. */
-        device_power_button();
-        plat_pause(was_paused);
+        runctl_call_wait([](void *) { device_power_button(); }, nullptr);
         return;
     }
 

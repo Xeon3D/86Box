@@ -117,13 +117,20 @@ extern int sound_card_current[SOUND_CARD_MAX];
 extern void sound_add_handler(void (*get_buffer)(int32_t *buffer,
                                                  uint16_t len, void *priv),
                               void *priv);
+extern void sound_remove_handler(void (*get_buffer)(int32_t *buffer,
+                                                     uint16_t len, void *priv),
+                                 void *priv);
 
 extern void sound_in_add_handler(void (*put_buffer)(int16_t *buffer,
                                                      int len, void *priv),
                                  void *priv);
+extern void sound_in_remove_handler(void (*put_buffer)(int16_t *buffer,
+                                                        int len, void *priv),
+                                    void *priv);
 
 extern void sound_in_start_input(void);
 extern void sound_in_stop_input(void);
+extern void sound_in_set_test_tone(double hz, double dbfs); /* automation "audio tone" */
 
 extern void music_add_handler(void (*get_buffer)(int32_t *buffer,
                                                  uint16_t len, void *priv),
@@ -162,7 +169,6 @@ extern int         sound_card_has_input(int card);
 extern const char *sound_card_get_internal_name(int card);
 extern int         sound_card_get_from_internal_name(const char *s);
 extern void        sound_card_init(void);
-extern void        sound_set_cd_volume(unsigned int vol_l, unsigned int vol_r);
 
 extern void sound_speed_changed(void);
 
@@ -199,10 +205,6 @@ extern int         al_capture_available(void);
 extern void        al_capture_start(void);
 extern void        al_capture_stop(void);
 extern void        al_capture_get_data(int16_t *buf, size_t *len);
-
-#ifdef bool
-extern bool        fast_forward;
-#endif
 
 extern unsigned long long src_freqs[I_MAX];
 
@@ -366,6 +368,9 @@ extern const device_t mmb_device;
 /* Media Vision */
 extern const device_t thunderboard_device;
 extern const device_t jazz16_device;
+
+/* Oak Technology OTI-601 */
+extern const device_t mozart_device;
 
 /* OPTi 82c93x */
 extern const device_t acermagic_s20_device;

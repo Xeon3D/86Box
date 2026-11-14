@@ -65,14 +65,17 @@ typedef int sock_t;
 #include <86box/device.h>
 #include <86box/timer.h>
 #include <86box/fdd.h>
+#include <86box/fdd_folder.h>
 #include <86box/cdrom.h>
 #include <86box/hdd.h>
 #include <86box/machine.h>
 #include <86box/sound.h>
 #include <86box/keyboard.h>
+#include <86box/io.h>
 #include <86box/mem.h>
 #include <86box/mouse.h>
 #include <86box/path.h>
+#include <86box/pci.h>
 #include <86box/plat.h>
 #include <86box/thread.h>
 #include <86box/ui.h>
@@ -83,6 +86,7 @@ typedef int sock_t;
 #include <86box/char.h>
 #include <86box/serial.h>
 #include <86box/automation.h>
+#include <86box/runctl.h>
 #include <zstd.h>
 #ifdef USE_GDBSTUB
 #    include <86box/gdbstub.h>
@@ -165,7 +169,6 @@ static strbuf_t   resp;
 
 /* CPU thread state. */
 static int      held;
-extern bool     fast_forward; /* the UI's (qt_main.cpp, sdl_main.c) */
 static int      cmd;          /* long-running command in progress */
 static int      cmd_was_held; /* hold again once the command finishes */
 static uint64_t cmd_deadline; /* emulated ms at which step/wait ends */
@@ -190,9 +193,6 @@ static uint32_t soft_resets;
 static uint64_t last_reset_ms;
 
 /* Emulation speed, sampled over each second of emulated time. */
-static uint32_t speed_wall_start;
-static uint64_t speed_emu_start;
-static int      speed_percent = -1;
 
 /* Most recent frame handed to the renderer for monitor 0. */
 static mutex_t  *frame_mutex;
@@ -372,14 +372,93 @@ peek_phys(uint32_t addr)
     return val;
 }
 
-/* The same for a client's writes (memw). */
-static void
-poke_phys(uint32_t addr, uint8_t val)
+/* memr and memw's views: the mem_view_*() ones, and linear, the processor's
+   view through its page tables. */
+#define VIEW_LINEAR -1
+
+/* The words after memr's or memw's first two: a view and an access width
+   (1, 2 or 4), in either order. Returns 0 on a word that is neither. */
+static int
+mem_options(int argc, char **argv, int *view, int *width)
+{
+    static const struct {
+        const char *name;
+        int         view;
+    } views[] = {
+        { "bus", MEM_VIEW_BUS },
+        { "cpu", MEM_VIEW_CPU },
+        { "normal", MEM_VIEW_CPU_NORMAL },
+        { "smm", MEM_VIEW_CPU_SMM },
+        { "linear", VIEW_LINEAR },
+    };
+
+    *view  = MEM_VIEW_BUS;
+    *width = 1;
+    for (int i = 3; i < argc; i++) {
+        int known = 0;
+
+        if (!strcmp(argv[i], "1") || !strcmp(argv[i], "2") || !strcmp(argv[i], "4")) {
+            *width = atoi(argv[i]);
+            known  = 1;
+        }
+        for (size_t j = 0; !known && (j < (sizeof(views) / sizeof(views[0]))); j++) {
+            if (!strcmp(argv[i], views[j].name)) {
+                *view = views[j].view;
+                known = 1;
+            }
+        }
+        if (!known)
+            return 0;
+    }
+    return 1;
+}
+
+/* One access of width bytes for a client, not charged to the emulated CPU
+   (see peek_phys). A linear address is translated as the processor would,
+   but with supervisor rights, so a debugger reaches user and read-only pages
+   alike. Returns 0 if a linear address has no page. */
+static int
+mem_access(int view, uint32_t addr, int width, int write, uint32_t *val)
 {
     int saved = cycles;
 
-    mem_writeb_phys(addr, val);
+    if (view == VIEW_LINEAR) {
+        if (((addr & 0xfff) + width) > 0x1000) {
+            /* Across a page boundary: byte by byte, each through its page. */
+            uint32_t v = 0;
+
+            for (int i = 0; i < width; i++) {
+                uint32_t b = (*val >> (i << 3)) & 0xff;
+
+                if (!mem_access(view, addr + i, 1, write, &b))
+                    return 0;
+                v |= b << (i << 3);
+            }
+            if (!write)
+                *val = v;
+            return 1;
+        }
+        if (cr0 >> 31) {
+            int      saved_override = cpl_override;
+            uint64_t pa;
+
+            cpl_override = 1;
+            pa           = mmutranslate_noabrt(addr, write);
+            cpl_override = saved_override;
+            if (pa > 0xffffffffULL)
+                return 0;
+            addr = (uint32_t) pa;
+        }
+        addr &= rammask;
+        view = MEM_VIEW_CPU;
+    }
+
+    if (write)
+        mem_view_write(view, addr, *val, width);
+    else
+        *val = mem_view_read(view, addr, width);
     cycles = saved;
+    return 1;
 }
 
 static int
@@ -747,10 +826,10 @@ cmd_info(void)
             continue;
         sb_printf(&resp, "%s{\"port\":%d,\"device\":", first ? "" : ",", i + 1);
         sb_json_string(&resp, com_ports[i].device ? char_get_device(com_ports[i].device)->internal_name : "none");
-        if (com_ports[i].serial && com_ports[i].serial->char_port.attached)
+        if (com_ports[i].char_port.attached)
             sb_printf(&resp, ",\"baud\":%u,\"data_bits\":%u,\"parity\":%u,\"stop_bits\":%u",
-                      com_ports[i].serial->char_port.com.baud, com_ports[i].serial->char_port.com.data_bits,
-                      com_ports[i].serial->char_port.com.parity, com_ports[i].serial->char_port.com.stop_bits);
+                      com_ports[i].char_port.com.baud, com_ports[i].char_port.com.data_bits,
+                      com_ports[i].char_port.com.parity, com_ports[i].char_port.com.stop_bits);
         if (s) {
             sb_printf(&resp, ",\"pos\":%llu,\"oldest\":%llu,\"last_ms\":%llu,\"pending\":%d",
                       (unsigned long long) s->out_pos, (unsigned long long) serial_oldest(s),
@@ -766,7 +845,7 @@ cmd_info(void)
 #endif
     sb_printf(&resp, ",\"hard_resets\":%u,\"soft_resets\":%u,\"last_reset_ms\":%llu,\"speed_percent\":%d,"
                      "\"ms\":%llu,\"frames\":%llu,\"held\":%s,\"paused\":%s,\"w\":%d,\"h\":%d}",
-              hard_resets, soft_resets, (unsigned long long) last_reset_ms, speed_percent,
+              hard_resets, soft_resets, (unsigned long long) last_reset_ms, runctl_speed(),
               (unsigned long long) emu_ms, (unsigned long long) frame_count, held ? "true" : "false",
               dopause ? "true" : "false", frame_w, frame_h);
 }
@@ -1060,7 +1139,7 @@ aud_stop(strbuf_t *sb)
         sb_printf(sb, "]}");
 }
 
-/* audio start <dir> | audio stop | audio level <ms> | audio read <stream> <ms> */
+/* audio start <dir> | audio stop | audio level <ms> | audio read <stream> <ms> | audio tone <hz> [<dBFS>] */
 static void
 handle_audio(int argc, char **argv, char **rest)
 {
@@ -1224,9 +1303,15 @@ handle_audio(int argc, char **argv, char **rest)
         sb_base64(&resp, (const uint8_t *) out, n * 2 * sizeof(int16_t));
         sb_printf(&resp, "\"}");
         free(out);
+    } else if (((argc == 3) || (argc == 4)) && !strcmp(argv[1], "tone")) {
+        /* audio tone <hz> [<dBFS>]: a sine (default -6 dBFS) replaces the
+           host's input (what cards record); audio tone 0 gives it back. */
+        sound_in_set_test_tone(strtod(argv[2], NULL), (argc == 4) ? strtod(argv[3], NULL) : -6.0);
+        resp.len = 0;
+        sb_printf(&resp, "{\"ok\":true,\"ms\":%llu}", (unsigned long long) emu_ms);
     } else
         respond_error("usage: audio start [<dir>] | audio stop | audio level <ms> | audio read <stream> <ms> | "
-                      "audio pull <stream> <from> [max_frames]");
+                      "audio pull <stream> <from> [max_frames] | audio tone <hz> [<dBFS>]");
 }
 
 /* wait sound / wait silence: arm the tap, or check it each quantum. */
@@ -1797,6 +1882,32 @@ media_why(char *why, const char *what)
     return why;
 }
 
+/* The client's next bytes, or <= 0 once it's gone or we're closing. A shutdown() from another
+   thread doesn't wake a blocking recv() on Winsock, so automation_close() would wait for as long
+   as the client stays connected: there, wait in short steps and look at the flag. */
+static int
+client_recv(char *buf, int len)
+{
+#ifdef _WIN32
+    for (;;) {
+        fd_set         rd;
+        struct timeval tv = { 0, 100000 };
+        int            r;
+
+        if (!enabled)
+            return 0;
+        FD_ZERO(&rd);
+        FD_SET(client_fd, &rd);
+        r = select(0, &rd, NULL, NULL, &tv);
+        if (r < 0)
+            return r;
+        if (r > 0)
+            break;
+    }
+#endif
+    return recv(client_fd, buf, len, 0);
+}
+
 /* media put <name> <bytes>, then the bytes: runs on the listener thread,
    which takes them off the connection itself, while the machine runs on.
    `buf` holds the `have` bytes that arrived with the request line; *used
@@ -1859,7 +1970,7 @@ media_put(const char *args, const char *buf, size_t have, size_t *used)
     *used = n;
     left -= n;
     while (left) {
-        int r = recv(client_fd, chunk, (int) ((left < sizeof(chunk)) ? left : sizeof(chunk)), 0);
+        int r = client_recv(chunk, (int) ((left < sizeof(chunk)) ? left : sizeof(chunk)));
         if (r <= 0) {
 #ifndef _WIN32
             if ((r < 0) && (errno == EINTR))
@@ -1947,7 +2058,7 @@ handle_request(char *line)
         sb_json_string(&resp, EMU_VERSION_FULL);
         sb_printf(&resp, ",\"ms\":%llu,\"frames\":%llu,\"held\":%s,\"paused\":%s,\"ff\":%s,\"w\":%d,\"h\":%d,\"bios_mode\":%d,\"quantum_ms\":%d}",
                   (unsigned long long) emu_ms, (unsigned long long) frame_count, held ? "true" : "false",
-                  dopause ? "true" : "false", fast_forward ? "true" : "false", frame_w, frame_h, mode, force_10ms ? 10 : 1);
+                  dopause ? "true" : "false", (runctl_mode() == RUN_MODE_FAST) ? "true" : "false", frame_w, frame_h, mode, force_10ms ? 10 : 1);
     } else if (!strcmp(argv[0], "hold")) {
         held = 1;
         respond_ok_time();
@@ -1961,10 +2072,10 @@ handle_request(char *line)
             respond_error("ff takes on or off");
         } else {
             if (argc == 2)
-                plat_fast_forward(!strcmp(argv[1], "on"));
+                runctl_set_mode(!strcmp(argv[1], "on") ? RUN_MODE_FAST : RUN_MODE_REALTIME);
             resp.len = 0;
             sb_printf(&resp, "{\"ok\":true,\"ff\":%s,\"ms\":%llu,\"frames\":%llu,\"held\":%s}",
-                      fast_forward ? "true" : "false", (unsigned long long) emu_ms,
+                      (runctl_mode() == RUN_MODE_FAST) ? "true" : "false", (unsigned long long) emu_ms,
                       (unsigned long long) frame_count, held ? "true" : "false");
         }
     } else if (!strcmp(argv[0], "step") && (argc == 2)) {
@@ -2171,34 +2282,138 @@ handle_request(char *line)
         cmd_info();
     } else if (!strcmp(argv[0], "text")) {
         cmd_text();
-    } else if (!strcmp(argv[0], "memr") && (argc == 3)) {
+    } else if (!strcmp(argv[0], "memr") && (argc >= 3) && (argc <= 5)) {
         uint32_t addr = strtoul(argv[1], NULL, 0);
         int      len  = atoi(argv[2]);
+        int      view;
+        int      width;
+        int      i;
         uint8_t *buf;
-        if ((len <= 0) || (len > MEM_MAX)) {
-            respond_error("length out of range");
+        if (!mem_options(argc, argv, &view, &width)) {
+            respond_error("options are a view (bus, cpu, normal, smm, linear) and a width (1, 2, 4)");
+        } else if ((len <= 0) || (len > MEM_MAX) || (len % width)) {
+            respond_error("length out of range, or not a multiple of the width");
         } else {
             buf = malloc(len);
-            for (int i = 0; i < len; i++)
-                buf[i] = peek_phys(addr + i);
-            resp.len = 0;
-            sb_printf(&resp, "{\"ok\":true,\"addr\":%u,\"data\":\"", addr);
-            sb_hex(&resp, buf, len);
-            sb_printf(&resp, "\"}");
+            for (i = 0; i < len; i += width) {
+                uint32_t val;
+                if (!mem_access(view, addr + i, width, 0, &val))
+                    break;
+                for (int j = 0; j < width; j++)
+                    buf[i + j] = val >> (j << 3);
+            }
+            if (i < len) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "no page at linear 0x%08X", addr + i);
+                respond_error(msg);
+            } else {
+                resp.len = 0;
+                sb_printf(&resp, "{\"ok\":true,\"addr\":%u,\"data\":\"", addr);
+                sb_hex(&resp, buf, len);
+                sb_printf(&resp, "\"}");
+            }
             free(buf);
         }
-    } else if (!strcmp(argv[0], "memw") && (argc == 3)) {
+    } else if (!strcmp(argv[0], "memw") && (argc >= 3) && (argc <= 5)) {
         uint32_t addr = strtoul(argv[1], NULL, 0);
         uint8_t *buf  = malloc(strlen(argv[2]) / 2 + 1);
         int      len  = parse_hex_bytes(argv[2], buf, strlen(argv[2]) / 2 + 1);
-        if (len <= 0) {
-            respond_error("bad hex bytes");
+        int      view;
+        int      width;
+        int      i;
+        if (!mem_options(argc, argv, &view, &width)) {
+            respond_error("options are a view (bus, cpu, normal, smm, linear) and a width (1, 2, 4)");
+        } else if ((len <= 0) || (len % width)) {
+            respond_error("bad hex bytes, or not a multiple of the width");
         } else {
-            for (int i = 0; i < len; i++)
-                poke_phys(addr + i, buf[i]);
-            respond_ok_time();
+            for (i = 0; i < len; i += width) {
+                uint32_t val = 0;
+                for (int j = 0; j < width; j++)
+                    val |= (uint32_t) buf[i + j] << (j << 3);
+                if (!mem_access(view, addr + i, width, 1, &val))
+                    break;
+            }
+            if (i < len) {
+                char msg[80];
+                snprintf(msg, sizeof(msg), "no page at linear 0x%08X; %d bytes written", addr + i, i);
+                respond_error(msg);
+            } else
+                respond_ok_time();
         }
         free(buf);
+    } else if (!strcmp(argv[0], "ior") && ((argc == 3) || (argc == 4))) {
+        uint32_t port  = strtoul(argv[1], NULL, 0);
+        int      width = atoi(argv[2]);
+        int      count = (argc == 4) ? atoi(argv[3]) : 1;
+        if ((port > 0xffff) || ((width != 1) && (width != 2) && (width != 4)) || (count <= 0) || ((count * width) > MEM_MAX)) {
+            respond_error("port, width (1, 2, 4) or count out of range");
+        } else {
+            int saved = cycles;
+            resp.len  = 0;
+            sb_printf(&resp, "{\"ok\":true,\"port\":%u,\"values\":[", port);
+            /* Successive ports, as INS with the direction flag clear. */
+            for (int i = 0; i < count; i++) {
+                uint16_t p = port + (i * width);
+                uint32_t v = (width == 4) ? inl(p) : ((width == 2) ? inw(p) : inb(p));
+                sb_printf(&resp, "%s%u", i ? "," : "", v);
+            }
+            sb_printf(&resp, "]}");
+            cycles = saved;
+        }
+    } else if (!strcmp(argv[0], "iow") && (argc >= 4)) {
+        uint32_t port  = strtoul(argv[1], NULL, 0);
+        int      width = atoi(argv[2]);
+        if ((port > 0xffff) || ((width != 1) && (width != 2) && (width != 4))) {
+            respond_error("port or width (1, 2, 4) out of range");
+        } else {
+            int saved = cycles;
+            /* Each value to the next port up, as OUTS would. A request
+               holds at most 13 values; send more requests for more. */
+            for (int i = 3; i < argc; i++) {
+                uint16_t p = port + ((i - 3) * width);
+                uint32_t v = strtoul(argv[i], NULL, 0);
+                if (width == 4)
+                    outl(p, v);
+                else if (width == 2)
+                    outw(p, v);
+                else
+                    outb(p, v);
+            }
+            cycles = saved;
+            respond_ok_time();
+        }
+    } else if ((!strcmp(argv[0], "pcir") && (argc >= 5) && (argc <= 7)) || (!strcmp(argv[0], "pciw") && ((argc == 6) || (argc == 7)))) {
+        int      write = !strcmp(argv[0], "pciw");
+        uint32_t bus   = strtoul(argv[1], NULL, 0);
+        uint32_t dev   = strtoul(argv[2], NULL, 0);
+        uint32_t func  = strtoul(argv[3], NULL, 0);
+        uint32_t reg   = strtoul(argv[4], NULL, 0);
+        uint8_t  buf[256];
+        int      len   = write ? parse_hex_bytes(argv[5], buf, sizeof(buf)) : ((argc >= 6) ? atoi(argv[5]) : 4);
+        int      width = (argc == 7) ? atoi(argv[6]) : 1;
+        int      present = 0;
+        if ((bus > 255) || (dev > 31) || (func > 7) || (reg > 255) || ((width != 1) && (width != 2) && (width != 4))) {
+            respond_error("bus, device, function, register or width (1, 2, 4) out of range");
+        } else if ((len <= 0) || ((reg + len) > 256) || (len % width)) {
+            respond_error("length past the 256-byte configuration space, or not a multiple of the width");
+        } else {
+            int saved = cycles;
+            for (int i = 0; i < len; i += width) {
+                if (write)
+                    present = pci_config_write(bus, dev, func, reg + i, width, buf + i);
+                else
+                    present = pci_config_read(bus, dev, func, reg + i, width, buf + i);
+            }
+            cycles = saved;
+            resp.len = 0;
+            sb_printf(&resp, "{\"ok\":true,\"present\":%s", present ? "true" : "false");
+            if (!write) {
+                sb_printf(&resp, ",\"data\":\"");
+                sb_hex(&resp, buf, len);
+                sb_printf(&resp, "\"");
+            }
+            sb_printf(&resp, "}");
+        }
     } else if (!strcmp(argv[0], "regs")) {
         static const char *names[8] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi" };
         resp.len                    = 0;
@@ -2293,11 +2508,20 @@ handle_request(char *line)
             ui_sb_update_icon_state(SB_FLOPPY | id, 1);
             respond_ok_time();
         } else if (!strcmp(argv[1], "load") && (argc >= 4)) {
-            fdd_close(&drives[id]);
-            drives[id].read_only = 0;
-            fdd_load(&drives[id], rest[3]);
-            ui_sb_update_icon_state(SB_FLOPPY | id, drives[id].image_path[0] ? 0 : 1);
-            respond_ok_time();
+            char *path = rest[3];
+            const int wp = !strncmp(path, "wp://", 5);
+            if (fdd_folder_source(path + wp * 5)) {
+                if (fdd_mount_folder(&drives[id], path + wp * 5, wp) == FDD_FOLDER_OK)
+                    respond_ok_time();
+                else
+                    respond_error("could not import folder or ZIP into the configured floppy drive");
+            } else {
+                fdd_close(&drives[id]);
+                drives[id].read_only = 0;
+                fdd_load(&drives[id], path);
+                ui_sb_update_icon_state(SB_FLOPPY | id, drives[id].image_path[0] ? 0 : 1);
+                respond_ok_time();
+            }
         } else
             respond_error("usage: fdd load <drive> <path> | fdd eject <drive>");
     } else if (!strcmp(argv[0], "cd") && (argc >= 3)) {
@@ -2394,17 +2618,6 @@ automation_quantum(void)
 
     emu_ms += force_10ms ? 10 : 1;
 
-    /* Speed while running, held steps included: emulated vs host time per
-       emulated second. Wall time spent held between requests is excluded. */
-    if (!speed_wall_start || (emu_ms - speed_emu_start) > 1000) {
-        speed_wall_start = plat_get_ticks();
-        speed_emu_start  = emu_ms;
-    } else if ((emu_ms - speed_emu_start) == 1000) {
-        uint32_t wall    = plat_get_ticks() - speed_wall_start;
-        speed_percent    = wall ? (int) (100000 / wall) : -1;
-        speed_wall_start = 0;
-    }
-
     if (cmd == CMD_NONE)
         return;
 
@@ -2488,7 +2701,7 @@ automation_thread(UNUSED(void *priv))
 
         while (enabled) {
             char *nl;
-            int   n = recv(client_fd, inbuf + inlen, (int) (sizeof(inbuf) - 1 - inlen), 0);
+            int   n = client_recv(inbuf + inlen, (int) (sizeof(inbuf) - 1 - inlen));
             if (n <= 0) {
 #ifndef _WIN32
                 if ((n < 0) && (errno == EINTR))
@@ -2536,9 +2749,11 @@ automation_thread(UNUSED(void *priv))
                     req_line[sizeof(req_line) - 1] = '\0';
                     thread_reset_event(req_done);
                     atomic_store(&req_pending, 1);
-                    thread_wait_event(req_done, -1);
+                    /* Closing (on a fatal error, say) wakes us without a reply; if its wake-up came
+                       just before the reset above, the flag still says so. */
+                    while (enabled && thread_wait_event(req_done, 100))
+                        ;
 
-                    /* Closing (on a fatal error, say) wakes us without a reply. */
                     if (!enabled || !write_all(client_fd, resp.buf, resp.len) || !write_all(client_fd, "\n", 1))
                         goto disconnect;
                 }

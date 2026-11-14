@@ -19,7 +19,7 @@
  *          Copyright 2021      Laci bá'
  *          Copyright 2021      dob205
  *          Copyright 2021      Andreas J. Reichel.
- *          Copyright 2021-2025 Jasmine Iwanek.
+ *          Copyright 2021-2026 Jasmine Iwanek.
  */
 #include <inttypes.h>
 #include <stdarg.h>
@@ -37,7 +37,6 @@
 #endif
 #ifdef __APPLE__
 #    include <string.h>
-#    include <dispatch/dispatch.h>
 #    ifdef __aarch64__
 #        include <pthread.h>
 #    endif
@@ -103,6 +102,7 @@
 #include <86box/plat_dir.h>
 #include <86box/version.h>
 #include <86box/gdbstub.h>
+#include <86box/debugger.h>
 #include <86box/automation.h>
 #include <86box/pc_block.h>
 #ifdef USE_AUTOMATION
@@ -114,6 +114,7 @@
 #include <86box/acpi.h>
 #include <86box/nv/vid_nv_rivatimer.h>
 #include <86box/vfio.h>
+#include <86box/runctl.h>
 
 /* Stuff that used to be globally declared in plat.h but is now extern there
    and declared here instead. */
@@ -213,6 +214,7 @@ int      confirm_reset                          = 1;              /* (G) enable 
 int      confirm_exit                           = 1;              /* (G) enable exit confirmation */
 int      confirm_save                           = 1;              /* (G) enable save confirmation */
 int      chd_precache_level                     = 0;              /* (G) CHD precache level */
+int      fast_forward_new_machines              = 0;              /* (G) New machines start in fast forward */
 int      pit_mode                               = -1;             /* (C) force setting PIT mode */
 int      fm_driver                              = 0;              /* (C) select FM sound driver */
 int      open_dir_usr_path                      = 0;              /* (G) default file open dialog directory
@@ -223,6 +225,7 @@ int      do_auto_pause                          = 0;              /* (G) Auto-pa
                                                                          loss */
 int      do_auto_dialog_pause                   = 0;              /* (G) Auto-pause the emulator on dialog boxes */
 int      force_constant_mouse                   = 0;              /* (C) Force constant updating of the mouse */
+int      fast_forward_on_start                  = 0;              /* (C) Start the machine in fast forward */
 int      hook_enabled                           = 1;              /* (C) Keyboard hook is enabled */
 int      test_mode                              = 0;              /* (C) Test mode */
 char     uuid[MAX_UUID_LEN]                     = { '\0' };       /* (C) UUID or machine identifier */
@@ -361,11 +364,6 @@ int  start_vmm = 1;
 /* Statistics. */
 extern int mmuflush;
 
-/* emulator % */
-int fps;
-int framecount;
-static uint32_t fps_sample_elapsed_ms = 1000;
-
 extern int output;
 int        atfullspeed;
 
@@ -382,7 +380,6 @@ int   scrnsz_x = SCREEN_RES_X; /* current screen size, X */
 int   scrnsz_y = SCREEN_RES_Y; /* current screen size, Y */
 #endif
 int config_changed; /* config has changed */
-int title_update;
 int framecountx        = 0;
 static pc_block_t pc_block; /* pc_run()'s carry from block to block */
 int hard_reset_pending = 0;
@@ -395,8 +392,6 @@ int efscrnsz_y = SCREEN_RES_Y;
 
 __thread int is_cpu_thread = 0;
 
-static ATOMIC_INT do_pause_ack = 0;
-static ATOMIC_INT pause_ack = 0;
 
 #define LOG_SIZE_BUFFER 8192            /* Log size buffer */
 
@@ -552,7 +547,7 @@ fatal(const char *fmt, ...)
     dumpregs(1);
 #endif
 
-    do_pause(2);
+    runctl_pause(RUN_PAUSE_FATAL);
 
     /* A connected automation client would wait forever on a machine that has
        stopped, behind a dialog it can't answer: send it the message and close
@@ -603,7 +598,7 @@ fatal_ex(const char *fmt, va_list ap)
     dumpregs(1);
 #endif
 
-    do_pause(2);
+    runctl_pause(RUN_PAUSE_FATAL);
 
     /* A connected automation client would wait forever on a machine that has
        stopped, behind a dialog it can't answer: send it the message and close
@@ -652,7 +647,7 @@ warning(const char *fmt, ...)
     fflush(stdlog);
     va_end(ap);
 
-    do_pause(2);
+    runctl_pause(RUN_PAUSE_MESSAGE);
 
     /* With an automation client, nobody may be there to dismiss the dialog,
        and while it's up the machine and the socket are stuck (headless, for
@@ -663,7 +658,7 @@ warning(const char *fmt, ...)
     fflush(stdlog);
     free(temp);
 
-    do_pause(0);
+    runctl_resume(RUN_PAUSE_MESSAGE);
 }
 
 void
@@ -693,7 +688,7 @@ warning_ex(const char *fmt, va_list ap)
     automation_log_text(temp, 1);
     fflush(stdlog);
 
-    do_pause(2);
+    runctl_pause(RUN_PAUSE_MESSAGE);
 
     /* With an automation client, nobody may be there to dismiss the dialog,
        and while it's up the machine and the socket are stuck (headless, for
@@ -704,7 +699,7 @@ warning_ex(const char *fmt, va_list ap)
     fflush(stdlog);
     free(temp);
 
-    do_pause(0);
+    runctl_resume(RUN_PAUSE_MESSAGE);
 }
 
 #ifdef ENABLE_PC_LOG
@@ -1685,6 +1680,19 @@ pc_init_modules(void)
         }
     }
 
+    /* A card that cannot drive a second monitor must not be initialised in a secondary
+       slot, even when an older configuration file still names one. */
+    for (uint8_t i = 1; i < GFXCARD_MAX; i++) {
+        if ((gfxcard[i] == VID_NONE) || (gfxcard[i] == VID_INTERNAL) || (gfxcard[i] == VID_EXTERNAL))
+            continue;
+        if (!video_card_is_secondary(machine, gfxcard[0], gfxcard[i])) {
+            memset(tempc, 0, sizeof(tempc));
+            device_get_name(video_card_getdevice(gfxcard[i]), 0, tempc);
+            pclog("Video card #%i \"%s\" cannot drive a secondary display, disabling it.\n", i + 1, tempc);
+            gfxcard[i] = VID_NONE;
+        }
+    }
+
     atfullspeed = 0;
 
     random_init();
@@ -1979,13 +1987,16 @@ pc_reset_hard_init(void)
     lpt_standalone_init();
     lpt_devices_init();
 
-    /* Reset and reconfigure the serial ports. */
-    /* note: SLIP COM side has to be initialized before the network side */
+    /* Reset the UARTs first. SLIP COM hardware needs its UART before the
+       network side, while char API modem backends attach after network cards
+       so their SLiRP ranges follow the ordinary network-card allocations. */
     serial_standalone_init();
-    serial_devices_init();
 
     /* Reset and reconfigure the Network Card layer. */
     network_reset();
+
+    /* Attach configured COM character devices after the network cards. */
+    serial_devices_init();
 
     /* Reset and reconfigure the MCA memory expansion boards. */
     mcamem_reset();
@@ -2013,6 +2024,7 @@ pc_reset_hard_init(void)
     /* Reset and reconfigure the SCSI layer. */
     scsi_card_init();
     usb_msd_hard_reset();
+    usb_flash_hard_reset();
 
     scsi_disk_hard_reset();
 
@@ -2183,23 +2195,6 @@ pc_close(UNUSED(thread_t *ptr))
     automation_close();
 }
 
-#ifdef __APPLE__
-static void
-_ui_emu_status(void *s)
-{
-    ui_emu_status(*((int *) s));
-}
-#endif
-
-void
-ack_pause(void)
-{
-    if (ATOMIC_LOAD(do_pause_ack)) {
-        ATOMIC_STORE(do_pause_ack, 0);
-        ATOMIC_STORE(pause_ack, 1);
-    }
-}
-
 void
 pc_run(void)
 {
@@ -2207,8 +2202,10 @@ pc_run(void)
     if (hard_reset_pending) {
         hard_reset_pending = 0;
         ibm5140_power_hard_off();
+        debugger_reset_begin();
         pc_reset_hard_close();
         pc_reset_hard_init();
+        debugger_reset_end();
     }
 
     /* USB devices the user plugged in or unplugged since the last block. It
@@ -2222,12 +2219,18 @@ pc_run(void)
     /* Run a block of code: a millisecond (or ten) of the CPU's cycles, the
        remainder carried over (pc_block.h). */
     startblit();
-    cpu_exec(pc_block_cycles(&pc_block, cpu_s->rspeed, force_10ms ? 100 : 1000));
-    ack_pause();
+    /* In an ACPI sleeping state the CPU stays stopped and only the timers
+       run, until a wake event. */
+    if (acpi_sleeping && !debugger_stopped())
+        acpi_sleep_run(pc_block_cycles(&pc_block, cpu_s->rspeed, force_10ms ? 100 : 1000));
+    else
+        debugger_cpu_exec(pc_block_cycles(&pc_block, cpu_s->rspeed, force_10ms ? 100 : 1000));
+    runctl_quantum_done(force_10ms ? 10000 : 1000);
 #ifdef USE_GDBSTUB /* avoid a KBC FIFO overflow when CPU emulation is stalled */
     if (gdbstub_step == GDBSTUB_EXEC) {
 #endif
-        if (!mouse_timed)
+        /* Likewise while the memory viewer holds the processor. */
+        if (!mouse_timed && !debugger_stopped())
             mouse_process();
 #ifdef USE_GDBSTUB /* avoid a KBC FIFO overflow when CPU emulation is stalled */
     }
@@ -2236,64 +2239,17 @@ pc_run(void)
     endblit();
 
     /* Done with this frame, update statistics. */
-    framecount++;
     if (++framecountx >= (force_10ms ? 100 : 1000)) {
         framecountx = 0;
         frames      = 0;
     }
-
-    if (title_update) {
-#ifdef __APPLE__
-        static
-#endif
-        int      speed_percent;
-        int      target_fps;
-        uint32_t elapsed_ms;
-        int64_t  numerator;
-
-        target_fps    = force_10ms ? 100 : 1000;
-        elapsed_ms    = fps_sample_elapsed_ms ? fps_sample_elapsed_ms : 1;
-
-#ifdef SCREENSHOT_MODE
-        if (force_10ms)
-            fps = ((fps + 2) / 5) * 5;
-        else
-            fps = ((fps + 20) / 50) * 50;
-#endif
-        /*
-         * Use real sample duration for title speed percent so delayed timer
-         * callbacks do not create false dip/rebound spikes in speed reporting.
-         */
-        numerator     = (int64_t) fps * 100000LL;
-        speed_percent = (int) ((numerator + ((int64_t) elapsed_ms * target_fps / 2)) /
-                               ((int64_t) elapsed_ms * target_fps));
-
-#ifdef __APPLE__
-        /* Needed due to modifying the UI on the non-main thread is a big no-no. */
-        dispatch_async_f(dispatch_get_main_queue(), &speed_percent, _ui_emu_status);
-#else
-        ui_emu_status(speed_percent);
-#endif
-        title_update = 0;
-    }
 }
 
-/* Handler for the 1-second timer to refresh the window title. */
+/* Handler for the 1-second timer: sample the emulation speed. */
 void
 pc_onesec(void)
 {
-    static uint32_t last_sample_ms = 0;
-    uint32_t        now_ms         = plat_get_ticks();
-
-    fps_sample_elapsed_ms = last_sample_ms ? (now_ms - last_sample_ms) : 1000;
-    if (!fps_sample_elapsed_ms)
-        fps_sample_elapsed_ms = 1;
-    last_sample_ms = now_ms;
-
-    fps        = framecount;
-    framecount = 0;
-
-    title_update = 1;
+    runctl_speed_update();
 }
 
 void
@@ -2442,21 +2398,6 @@ set_screen_size_natural(void)
         set_screen_size(monitors[i].mon_unscaled_size_x, monitors[i].mon_unscaled_size_y);
 }
 
-
-void
-do_pause(int p)
-{
-    int old_p = dopause;
-
-    if ((p == 1) && !old_p)
-        do_pause_ack = p;
-    dopause = !!p;
-    if ((p == 1) && !old_p) {
-        while (!ATOMIC_LOAD(pause_ack))
-            ;
-    }
-    ATOMIC_STORE(pause_ack, 0);
-}
 
 // Helper to find an accelerator key and return it's index in acc_keys
 int FindAccelerator(const char *name) {

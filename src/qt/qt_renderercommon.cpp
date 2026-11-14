@@ -132,7 +132,16 @@ RendererCommon::onResize(int width, int height)
     output_size = QSize(width, height);
 
     const auto &monitor = monitors[r_monitor_index];
-    if (!force_43 && force_device_aspect && monitor.mon_device_aspect_x > 0 && monitor.mon_device_aspect_y > 0) {
+    /* A window sized to the picture without HiDPI scaling can't always be made exactly
+       that many device pixels large, so show the picture at its own size instead of
+       stretching it by a pixel. */
+    const int  slack    = static_cast<int>(std::ceil(pixelRatio));
+    const bool unscaled = !apply_scale && !dpi_scale && (vid_resize == 0) &&
+                          (width >= monitor.mon_scrnsz_x) && (width - monitor.mon_scrnsz_x) <= slack &&
+                          (height >= monitor.mon_scrnsz_y) && (height - monitor.mon_scrnsz_y) <= slack;
+    if (unscaled)
+        destination.setRect(0, 0, monitor.mon_scrnsz_x, monitor.mon_scrnsz_y);
+    else if (!force_43 && force_device_aspect && monitor.mon_device_aspect_x > 0 && monitor.mon_device_aspect_y > 0) {
         int dw = width;
         int dh = qRound((double) width * monitor.mon_device_aspect_y / monitor.mon_device_aspect_x);
         if (dh > height) {
@@ -187,6 +196,18 @@ RendererCommon::onResize(int width, int height)
                 dy = (hh - dh) / 2.0;
                 destination.setRect((int) dx, (int) dy, (int) dw, (int) dh);
                 break;
+            case FULLSCR_SCALE_INT43_VERT:
+                /* Like 4:3 integer scale, but the height is a whole multiple of the guest's line count
+                   and the width follows from the 4:3 ratio. Every guest line gets the same number of
+                   host lines, which scanline shaders need. */
+                dh = (r43 <= hsr) ? hh : (hw / r43);
+                integer_scale(&dh, &gh);
+                dw = std::round(dh * r43);
+
+                dx = (hw - dw) / 2.0;
+                dy = (hh - dh) / 2.0;
+                destination.setRect((int) dx, (int) dy, (int) dw, (int) dh);
+                break;
             case FULLSCR_SCALE_43:
             case FULLSCR_SCALE_KEEPRATIO:
                 if (temp_fullscreen_scale == FULLSCR_SCALE_43)
@@ -226,8 +247,9 @@ RendererCommon::onResize(int width, int height)
     if (destination.width() == 0) destination.setWidth(256);
     if (destination.height() == 0) destination.setHeight(256);
 
-    monitors[r_monitor_index].mon_res_x = (double) destination.width();
-    monitors[r_monitor_index].mon_res_y = (double) destination.height();
+    /* Mouse movement is scaled by the size of the picture in device-independent pixels. */
+    monitors[r_monitor_index].mon_picture_x = destination.width() / pixelRatio;
+    monitors[r_monitor_index].mon_picture_y = destination.height() / pixelRatio;
 
     destinationF.setRect((double) destination.x() / (double) width, (double) destination.y() / (double) height,
                          (double) destination.width() / (double) width, (double) destination.height() / (double) height);

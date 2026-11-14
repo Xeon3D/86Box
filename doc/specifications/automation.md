@@ -9,8 +9,8 @@ Build with `-D AUTOMATION=ON`, then start 86Box with:
 86Box listens on the endpoint and accepts one client at a time.
 `--automation-hold` starts the machine **held**: no emulated time passes until
 a client asks for it. That makes runs repeatable and lets a slow client (a
-test harness, a script, an AI agent) take as long as it needs between
-moves.
+test harness, a script, an [AI agent](https://github.com/dafugg/86box-mcp)) take
+as long as it needs between moves.
 
 ## Transports and security
 
@@ -94,14 +94,19 @@ startup), `frames` (frames rendered) and `held`.
 | `audio start [<dir>]` / `audio stop` | Record every sound stream: with `<dir>`, as `<dir>/<stream>.wav`; without, in memory only, for a client on another machine to fetch with `audio pull`. The WAVs are (16-bit stereo, each at its own rate): `main` (the sound cards' digital audio, at the configured sample rate), `music` (OPL FM and the PC speaker, 49716 Hz), `wavetable`, `ym2151`, `cd`, `fdd`, `hdd`, `midi`. The streams polled on emulated timers (`main`, `music`, `wavetable`, `ym2151`) are sample-exact: frame n is at `start_ms + n * 1000 / rate`. The others are rendered on their own threads and are dated by when their blocks arrive. A stream whose rate changes goes on in a new segment (`<stream>-2.wav` and so on). `stop` replies with `start_ms` and each segment's `name`, `segment`, `rate`, `frames`, `start_ms`, `exact` and `file` (with a directory), and for a sample-exact stream `drift_frames`: frames written and pending, against the emulated time elapsed (0 means no gap). Capture runs whether or not the host has a sound device, and while fast-forwarding. |
 | `audio level <ms>` | Peak and RMS level (dBFS) of each stream over its last `ms` (up to 30 s), with `rate` and `last_ms`, when its last block arrived. |
 | `audio read <stream> <ms>` | The stream's last `ms` (up to 30 s) as base64 16-bit stereo `data`, with `rate`, `frames` and `end_ms`. |
+| `audio tone <hz> [<dBFS>]` | Feed a sine wave into guest audio input on both channels. The default level is −6 dBFS. Use `audio tone 0` to restore host input. |
 | `audio pull <stream> <from> [<max_frames>]` | The recording's samples for one stream, from position `from` (frames since the recording, or the segment, started) up to now, or up to where it stopped: base64 16-bit stereo `data`, with `segment`, `rate`, `from`, `frames`, `next` (the `from` for the next pull, so successive pulls join exactly), `recording`, and `lost`: frames that left the 30 s ring before they were pulled. Works over TCP, and after `audio stop` for the last samples. After a rate change, pull the new `segment` from 0. |
 | `serial read <port> [<from> [<max>]]` | What the guest has sent on COM`<port>` from position `from` (default 0) on, at most `max` bytes (default and limit 65536), as hex `data`. With `from` and `next` (the `from` for the next read), `pos` (bytes sent so far), `lost` (bytes asked for that were no longer kept), `last_ms` (emulated time of the last byte), `pending` (bytes queued for the guest that it hasn't taken), `taken` (bytes it has taken), `attached`, and the lines: `dtr`, `rts`, `break` (set by the guest), `cts`, `dsr`, `dcd`, `ri` (seen by it). Fails if the port doesn't have the `automation` backend. |
 | `serial write <port> <hex>` | Queue bytes for the guest to receive on COM`<port>` (up to 65536 waiting). Reply has `queued` and `pending`; fails with `input queue full`, queueing nothing, if they don't fit. |
 | `serial lines <port> <cts> <dsr> <dcd> <ri>` | Set the modem status lines the guest sees, each 0 or 1 (CTS, DSR and DCD start on). Reply has the lines, as for `serial read`. |
 | `info` | Version, machine, CPU and clock, RAM, video and sound cards, mounted hard disk/floppy/CD images, `hard_resets`/`soft_resets` (every CPU reset, including a guest triple fault) and `last_reset_ms`, `speed_percent` (100 = real time), and `serial`: each enabled COM port's `port` and `device` (the backend's internal name, or `none`), the line settings the guest has programmed when a backend is attached (`baud`, `data_bits`, `parity`, `stop_bits`), and for an `automation` port `pos`, `oldest` (the first position still kept), `last_ms`, `pending` and the lines. In a build with the GDB stub, `gdbstub_port`. |
 | `text` | Text-mode screen via the BIOS data area: `mode`, `cols`, `rows`, `cursor` [row, col], and `chars`/`attrs` as one hex string per row (CP437). Fails in graphics modes. |
-| `memr <addr> <len>` | Read up to 65536 bytes of physical memory; `data` is hex. |
-| `memw <addr> <hex>` | Write bytes to physical memory. |
+| `memr <addr> <len> [<view>] [<width>]` | Read up to 65536 bytes of memory, anywhere in the 4 GB address space; `data` is hex. See [Memory views](#memory-views) for `view` and `width`. |
+| `memw <addr> <hex> [<view>] [<width>]` | Write bytes to memory. |
+| `ior <port> <width> [<count>]` | Read `count` (default 1) values of `width` bytes (1, 2 or 4) from `port` upward, as `IN` would; `values` is an array of numbers. |
+| `iow <port> <width> <value>...` | Write each value, `width` bytes, to the next port up, starting at `port`, as `OUT` would. |
+| `pcir <bus> <dev> <func> <reg> [<len> [<width>]]` | Read `len` bytes (default 4) of a PCI function's configuration space from `reg`, in configuration cycles of `width` bytes (default 1), straight from the function: the configuration mechanism and the guest's 0CF8h aren't touched. `data` is hex (FF where nothing answers); `present` says whether a card is at `bus`:`dev`. |
+| `pciw <bus> <dev> <func> <reg> <hex> [<width>]` | Write configuration space the same way. Reply has `present`. |
 | `regs` | General registers, `eip`, `eflags`, segment selectors, `cs_base`, `cr0`. From the 286: each segment's descriptor cache (`ds_base`, `ds_limit`, `ds_ar` and so on, `ar` being descriptor bytes 5 and 6: the access byte, then G, D/B, AVL and limit 19:16), `gdtr_base`/`gdtr_limit`, `idtr_base`/`idtr_limit`, `ldtr` and `tr` with their base, limit and `ar`, and `cpl`. From the 386: `cr2` (the last page-fault address), `cr3` (the page directory base), `dr0`–`dr3`, `dr6`, `dr7` and `smm`. `cr4` and `tsc` on CPUs that have them. No x86 CPU has a CR1 (`MOV` to or from it is an invalid opcode, see `src/cpu/x86_ops_mov_ctrl.h`), so there is none. |
 | `fpu` | The x87: `fcw`, `fsw` (with TOP), `ftw` (the full tag word, two bits per register), `top`, and `st0`–`st7` as 20 hex digits each (sign and exponent, then the significand), as FSAVE would store them. With MMX, `mm0`–`mm7` as 16 hex digits. Fails without an FPU. |
 | `fdd load <drive> <path>` / `fdd eject <drive>` | Change floppy media (drive 0 = A:). |
@@ -117,8 +122,28 @@ Numbers accept C syntax (`0x` hex, decimal).
 
 `wait`, `memr` and `text` read memory through the normal physical memory map,
 so a read in a memory-mapped device range may have side effects (for example,
-VGA latches). They don't cost the emulated CPU time, though: a device's wait
-states are not charged for reads and writes made for a client.
+VGA latches). The same goes for `ior` and `pcir`. They don't cost the emulated
+CPU time, though: a device's wait states are not charged for reads and writes
+made for a client.
+
+### Memory views
+
+`memr` and `memw` take, after their first two words and in either order, a
+view and an access width.
+
+| View | Whose view of memory |
+|---|---|
+| `bus` (the default) | The bus's: what DMA and bus masters see, as `wait mem` and `text` read it. |
+| `cpu` | The processor's, as it is now: with SMRAM when it is in SMM, and with mappings only the processor sees. |
+| `normal` | The processor's outside SMM, whether or not it is in SMM now. |
+| `smm` | The processor's in SMM, whether or not it is in SMM now: SMRAM, as the chipset has it set up. |
+| `linear` | The processor's, at a linear address: each page goes through the page tables when paging is on, with supervisor rights (user and read-only pages are reached too), then the A20 mask. A page that isn't present stops the request with `no page at linear <addr>`; `memw` has then written what came before it. |
+
+The width, 1 (the default), 2 or 4, is the size of each access, for device
+registers that must be read or written as words or dwords; `len`, or the
+number of bytes, must be a multiple of it. An access the mapping can't take
+whole, or that crosses a 4 KB boundary, is split as the processor would split
+it. `data` is always the bytes in memory order.
 
 Try it by hand:
 

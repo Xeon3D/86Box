@@ -600,10 +600,10 @@ VulkanWindowRenderer::finalize()
 #endif
 
     shaderLibraFilterChains.clear();
-#endif
 
 #ifndef LIBRASHADER_STATIC
 clean_up_rest:
+#endif
 #endif
     m_devFuncs->vkDestroyImageView(logi_device, src_image_view, nullptr);
     vmaDestroyImage(allocator, src_image, img_allocation);
@@ -1519,7 +1519,7 @@ VulkanWindowRenderer::initialize()
                 VmaAllocationCreateInfo allocInfo { };
                 allocInfo.pUserData = allocInfo.pool = nullptr;
                 allocInfo.requiredFlags = allocInfo.preferredFlags = 0;
-                allocInfo.usage                                    = VmaMemoryUsage::VMA_MEMORY_USAGE_AUTO;
+                allocInfo.usage                                    = VmaMemoryUsage::VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
                 allocInfo.flags                                    = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
                 if (vmaCreateImage(allocator, &img_info, &allocInfo, &src_image, &img_allocation, &allocatedInfo) != VK_SUCCESS) {
@@ -1658,9 +1658,9 @@ VulkanWindowRenderer::initialize()
                         }
                     }
                 }
-#endif
 #ifndef LIBRASHADER_STATIC
 skip_shaders:
+#endif
 #endif
                 if (video_framerate != -1) {
                     renderTimer->setTimerType(Qt::PreciseTimer);

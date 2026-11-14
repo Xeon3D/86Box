@@ -760,7 +760,11 @@ pipc_reset_hard(void *priv)
                 dev->ac97_regs[i][0x40] = 0x01;
                 dev->ac97_regs[i][0x43] = 0x1c;
                 dev->ac97_regs[i][0x48] = 0x01;
-                dev->ac97_regs[i][0x4b] = 0x00;
+                /* Game port base 200h. The VT8231 datasheet documents this default;
+                   the XP VIA AC'97 driver reads it as the game port's I/O resource on
+                   revision 20h and later, and BIOSes such as the 6VIA90AP's leave it. */
+                dev->ac97_regs[i][0x4a] = 0x00;
+                dev->ac97_regs[i][0x4b] = 0x02;
             }
 
             pipc_sgd_handlers(dev, i);
@@ -1267,6 +1271,7 @@ usb_update_io_mapping(pipc_t *dev, int func)
 {
     int on = !pipc_usb_disabled(dev, func - 2);
 
+    uhci_set_present(dev->usb[func - 2], on);
     uhci_update_io_mapping(dev->usb[func - 2], dev->usb_regs[func - 2][0x20] & ~0x1f, dev->usb_regs[func - 2][0x21], on && (dev->usb_regs[func - 2][PCI_REG_COMMAND] & PCI_COMMAND_IO));
     uhci_set_bus_master(dev->usb[func - 2], on && (dev->usb_regs[func - 2][PCI_REG_COMMAND] & PCI_COMMAND_L_BM));
 }

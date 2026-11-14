@@ -41,6 +41,7 @@
 #define AC97_CENTER_6B  (1 << 17) /* register 36 bit 5 (CNT5) */
 #define AC97_SURR_6B    (1 << 18) /* register 38 bits [13,5] (LSR5/RSR5) */
 #define AC97_GAIN_3B    (1 << 19) /* registers [1C:1E] (audio) or [46:4A] (modem) bits [8,0] are always 0 (spec violation?) if this is set */
+#define AC97_AD_SRG     (1 << 20) /* Analog Devices sample rate generators: registers 78/7A, selected by 76 */
 
 /* Reset bits (reset_flags), register 00. */
 #define AC97_MICPCM    (1 << 0)
@@ -104,7 +105,7 @@
 
 /* Codec IDs. */
 #define AC97_CODEC_AD1881   AC97_VENDOR_ID('A', 'D', 'S', 0x40)
-#define AC97_CODEC_AK4540   AC97_VENDOR_ID('A', 'D', 'S', 0x40)
+#define AC97_CODEC_AK4540   AC97_VENDOR_ID('A', 'K', 'M', 0x00)
 #define AC97_CODEC_ALC100   AC97_VENDOR_ID('A', 'L', 'C', 0x20)
 #define AC97_CODEC_CS4297   AC97_VENDOR_ID('C', 'R', 'Y', 0x03)
 #define AC97_CODEC_CS4297A  AC97_VENDOR_ID('C', 'R', 'Y', 0x11)

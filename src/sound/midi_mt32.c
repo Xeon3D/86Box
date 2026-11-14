@@ -375,6 +375,8 @@ mt32_close(void *priv)
     mt32_on = 0;
     thread_set_event(event);
     thread_wait(thread_h);
+    thread_destroy_event(event);
+    thread_destroy_event(start_event);
 
     event       = NULL;
     start_event = NULL;

@@ -76,6 +76,7 @@ Run the CMake commands at the repository root.
 | `R128_LANEGAP` | When set, adds the expected-failure polyline scissor-clamp vector. The modeled device does not implement that documented clamp. |
 | `R128_LANEGAP_LOG` | When set, exposes close-time JIT texture counters for the lane-gap and exceptional-coordinate devices. |
 | `R128_LANEGAP_TSAN` | When set, runs the two-writer texture-cache concurrency vector. Use a ThreadSanitizer build to check its synchronization. |
+| `R128_BARRIER_BENCH` | A call count N (nonzero) runs only the aperture-barrier timing probe: N miss calls per column on a fabricated GPU backend, idle, with a pending segment, with all ring slots submitted, and both, printed as nanoseconds per call; the linear-aperture dword handlers are timed the same way, and once with no backend as the floor. Needs Vulkan headers; prints nothing without them. |
 | `R128_X64LEGS` | When set, runs only the exceptional-coordinate device, honoring the caller's JIT mode. |
 | `R128_GPU_SYNC_TELEMETRY` | Selects the device's synchronization telemetry output. The telemetry runner redirects its own device to the null sink while testing counters. |
 
@@ -116,6 +117,18 @@ a resumed draw that holds at the released pointer position, and a CPU
 indirect-buffer fence made visible by the register-write drain. JIT verify
 and GPU modes use one CPU render thread, so deferred-batch checks apply
 only to the threaded CPU lane.
+
+The status vector in `gpu2d-verify` uses the same idle hook to hold the
+executor inside a pass of its loop and reads GUI_STAT, PM4_STAT and
+PC_GUI_CTLSTAT from the CPU thread. In a pass that a wake with no work
+caused, all three read idle; held after a packet and before the executor
+has reported idle for it, all three read busy. The registers follow the
+work the engine holds, not whether the executor thread is awake. A second
+status vector, in `agp-oracle` on the device with render workers, queues
+a batch from the CPU thread with a directly submitted indirect buffer and
+lets a wake with no work make the executor draw it. The bus-master write
+hook holds the executor at the first write of the staged color and depth
+buffers back to AGP memory, and the three registers read busy there.
 
 Capture vectors use an anonymous temporary file. On Windows, a failed
 anonymous-file open falls back to `_sopen_s` in the user's temporary

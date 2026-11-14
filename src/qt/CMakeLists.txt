@@ -237,6 +237,9 @@ add_library(ui STATIC
     qt_newfloppydialog.cpp
     qt_newfloppydialog.hpp
     qt_newfloppydialog.ui
+
+    qt_newflashdialog.cpp
+    qt_newflashdialog.hpp
     qt_harddiskdialog.cpp
     qt_harddiskdialog.hpp
     qt_harddiskdialog.ui
@@ -267,6 +270,11 @@ add_library(ui STATIC
     qt_mcadevicelist.hpp
     qt_mcadevicelist.cpp
     qt_mcadevicelist.ui
+
+    qt_memoryviewer.hpp
+    qt_memoryviewer.cpp
+    qt_disasm.hpp
+    qt_disasm.cpp
 
     qt_mediahistorymanager.cpp
     qt_mediahistorymanager.hpp
@@ -343,6 +351,13 @@ add_library(osd_backend OBJECT ${OSD_DIR}/imgui/imgui_impl_opengl3.cpp ${OSD_DIR
 set_target_properties(osd_backend PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 target_include_directories(osd_backend PRIVATE ${OSD_DIR}/imgui ${Vulkan_INCLUDE_DIRS})
 target_link_libraries(86Box osd_backend)
+
+# The memory viewer's disassembler, Zydis, from its copy in zydis/.
+if(DISASM)
+    add_subdirectory(zydis)
+    target_compile_definitions(ui PRIVATE USE_DISASM)
+    target_link_libraries(ui PRIVATE zydis)
+endif()
 
 target_sources(ui PRIVATE qt_osd.cpp qt_osd.hpp qt_osd_raster.cpp qt_osd_raster.hpp)
 target_include_directories(ui PRIVATE ${OSD_DIR} ${OSD_DIR}/imgui)
@@ -512,7 +527,7 @@ if (LIBRASHADER)
     if (LIBRASHADER_STATIC)
         if (LIBRASHADER_STATIC_FIND_LIB)
             find_library(LIBRASHADER_STATIC_LIB liblibrashader_capi.a REQUIRED)
-            target_link_libraries(ui PRIVATE "${LIBRASHADER_STATIC_LIB}" ntdll userenv)
+            target_link_libraries(ui PRIVATE "${LIBRASHADER_STATIC_LIB}" ntdll userenv synchronization)
         else()
             target_link_libraries(ui PRIVATE librashader_capi)
         endif()
@@ -531,6 +546,11 @@ if(WIN32)
             set(QT_WINDOWS_STYLE_PLUGIN Qt${QT_MAJOR}::QWindowsVistaStylePlugin)
         endif()
         qt_import_plugins(plat INCLUDE Qt${QT_MAJOR}::QWindowsIntegrationPlugin Qt${QT_MAJOR}::QICOPlugin ${QT_WINDOWS_STYLE_PLUGIN})
+        if(AUTOMATION)
+            # Headless automation selects QT_QPA_PLATFORM=offscreen. Static
+            # Windows builds must import it explicitly, like the native QPA.
+            target_link_libraries(plat PRIVATE Qt${QT_MAJOR}::QOffscreenIntegrationPlugin)
+        endif()
     else()
         if(USE_QT6)
             install(CODE "
@@ -566,6 +586,7 @@ endif()
 # based on https://stackoverflow.com/questions/35612687/cmake-macos-x-bundle-with-bundleutiliies-for-qt-application
 macro(install_qt5_plugin _qt_plugin_name _runtime_plugins_var _prefix)
     get_target_property(_qt_plugin_path "${_qt_plugin_name}" LOCATION)
+    get_filename_component(_qt_plugin_path "${_qt_plugin_path}" REALPATH) #adds a check to resolve any dylib symlinks so that the plugin is correctly copied to the bundle
     if(EXISTS "${_qt_plugin_path}")
         get_filename_component(_qt_plugin_file "${_qt_plugin_path}" NAME)
         get_filename_component(_qt_plugin_type "${_qt_plugin_path}" PATH)
@@ -762,3 +783,24 @@ endforeach()
 
 configure_file(qt_translations.qrc.in ${CMAKE_CURRENT_BINARY_DIR}/qt_translations.qrc)
 target_sources(ui PRIVATE ${QM_FILES} ${CMAKE_CURRENT_BINARY_DIR}/qt_translations.qrc)
+
+if(BUILD_TESTING)
+    add_executable(debugger_commands_tests
+        ../../tests/cpu/debugger_commands_test.cpp
+        qt_memoryviewer.cpp qt_memoryviewer.hpp
+    )
+    target_include_directories(debugger_commands_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src/include
+        ${PROJECT_BINARY_DIR}/src/include
+    )
+    target_link_libraries(debugger_commands_tests PRIVATE Qt${QT_MAJOR}::Widgets GTest::gtest)
+    if(QT_STATIC)
+        if(USE_QT6)
+            qt_import_plugins(debugger_commands_tests INCLUDE Qt6::QOffscreenIntegrationPlugin)
+        else()
+            qt5_import_plugins(debugger_commands_tests INCLUDE Qt5::QOffscreenIntegrationPlugin)
+        endif()
+    endif()
+    add_test(NAME DebuggerCommands COMMAND debugger_commands_tests)
+endif()

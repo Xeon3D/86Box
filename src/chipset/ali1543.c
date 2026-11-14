@@ -496,12 +496,22 @@ ali1533_write(int func, int addr, int len, uint8_t val, void *priv)
                 dev->pci_conf[addr] = val & 0x9f;
             else
                 dev->pci_conf[addr] = val & 0x1f;
-            acpi_set_mirq_is_level(dev->acpi, !!(val & 0x10));
-            if ((dev->type == 1) && (val & 0x80))
+            /* An active SCI is dropped from the old IRQ and raised again on
+               the new one, in the new trigger mode. */
+            if (dev->acpi->irq_state)
+                pci_clear_mirq(PCI_MIRQ5, dev->acpi->mirq_is_level, &dev->acpi->irq_state);
+            /* Bit 4 set turns the SCI from level into edge (M1543 76h, p. 53;
+               M1543C 76h, p. 81). */
+            acpi_set_mirq_is_level(dev->acpi, !(val & 0x10));
+            /* 0000b is IRQ 13, not off; the M1543C turns the SCI off with bit 7
+               set and 0000b, and routes it by bits 3-0 otherwise. */
+            if (val & 0x0f)
+                pci_set_mirq_routing(PCI_MIRQ5, ali1533_irq_routing[val & 0x0f]);
+            else if ((dev->type == 1) && (val & 0x80))
                 pci_set_mirq_routing(PCI_MIRQ5, PCI_IRQ_DISABLED);
             else
-                pci_set_mirq_routing(PCI_MIRQ5, ali1533_irq_routing[val & 0x0f]);
-            /* TODO: Tell ACPI to use MIRQ5 */
+                pci_set_mirq_routing(PCI_MIRQ5, 13);
+            acpi_update_irq(dev->acpi);
             break;
 
         case 0x77: /* SMBus IRQ Routing - we cheat and use MIRQ6 */
@@ -1505,6 +1515,37 @@ ali7101_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
     }
 }
 
+/* The M7101's side of the ACPI events (acpi.c):
+   - a power button press with 40h bit 2 set sets SSOG 42h bit 2, an SMI#
+     (M1543C p. 128 / PDF 129);
+   - an ACPI event in legacy mode (SCI_EN clear) asserts SMI# (M1543C p. 195 /
+     PDF 196);
+   both through the global SMI enable, 77h bit 3 (p. 143 / PDF 144);
+   - B4h bit 2 turns the power button override off (p. 158 / PDF 159). */
+static int
+ali7101_acpi_event(void *priv, int event)
+{
+    ali1543_t *dev = (ali1543_t *) priv;
+
+    switch (event) {
+        case ACPI_HOOK_PWRBTN:
+            if (dev->pmu_conf[0x40] & 0x04) {
+                dev->pmu_conf[0x42] |= 0x04;
+                if (dev->pmu_conf[0x77] & 0x08)
+                    smi_raise();
+            }
+            return 1;
+        case ACPI_HOOK_SMI:
+            if (dev->pmu_conf[0x77] & 0x08)
+                smi_raise();
+            return 1;
+        case ACPI_HOOK_OVERRIDE:
+            return !(dev->pmu_conf[0xb4] & 0x04);
+        default:
+            return 0;
+    }
+}
+
 static uint8_t
 ali7101_read(int func, int addr, UNUSED(int len), void *priv)
 {
@@ -1729,6 +1770,7 @@ ali1543_init(const device_t *info)
 
     /* ACPI */
     dev->acpi = device_add(&acpi_ali_device);
+    acpi_set_event_hook(dev->acpi, ali7101_acpi_event, dev);
     dev->nvr  = device_add_params(&nvr_at_device, (void *) (uintptr_t) NVR_PIIX4);
     timer_add(&dev->wdt_timer, ali7101_wdt_timer, dev, 0);
 

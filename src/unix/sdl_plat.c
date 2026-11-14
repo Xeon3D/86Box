@@ -23,6 +23,7 @@
 #include <86box/hdd.h>
 #include <86box/path.h>
 #include <86box/plat.h>
+#include <86box/runctl.h>
 #include <86box/ui.h>
 #include <86box/version.h>
 #include "cpu.h"
@@ -191,6 +192,8 @@ plat_get_string(int i)
             return "Unable to load image \"%s\": libaaruformat.so is missing, which is required for Aaru format image support.";
         case STRING_CDROM_DVD_IN_CD_DRIVE:
             return "The DVD image \"%s\" has been inserted into a drive that does not support DVD media and will be ignored.";
+        case STRING_CDROM_IMAGE_TOO_LARGE:
+            return "The image \"%s\" exceeds the maximum capacity of this drive and will be ignored.";
         case STRING_CHARDEV_CONNECT_ERROR:
             return "%s: Could not connect to %s: %s";
         case STRING_CHARDEV_CREATE_ERROR:
@@ -422,6 +425,23 @@ plat_get_ticks(void)
     return (uint32_t) (plat_get_ticks_common() / 1000);
 }
 
+uint64_t
+plat_get_ns(void)
+{
+    static uint64_t start;
+    static uint64_t freq;
+
+    if (!freq) {
+        start = SDL_GetPerformanceCounter();
+        freq  = SDL_GetPerformanceFrequency();
+    }
+
+    const uint64_t t = SDL_GetPerformanceCounter() - start;
+
+    /* Split, so t * 1e9 can't overflow. */
+    return ((t / freq) * 1000000000ULL) + (((t % freq) * 1000000000ULL) / freq);
+}
+
 void
 plat_delay_ms(uint32_t count)
 {
@@ -445,31 +465,30 @@ plat_power_off(void)
        run before the main thread is terminated */
     cycles -= 99999999;
 
-    cpu_thread_run = 0;
+    runctl_request_stop();
 }
 
-extern bool fast_forward; /* sdl_main.c */
-
+/* Run state changes (runctl.h): mark the title while paused. */
 void
-plat_fast_forward(int on)
-{
-    fast_forward = !!on;
-}
-
-void
-plat_pause(int p)
+ui_notify(int what)
 {
     static char oldtitle[512];
+    static int  was_paused = 0;
     char        title[512];
 
-    if ((!!p) == dopause)
+    if (what == UI_NOTIFY_SPEED) {
+        ui_emu_status(runctl_speed());
+        return;
+    }
+    if (what != UI_NOTIFY_RUN_STATE)
         return;
 
-    if ((p == 0) && (time_sync & TIME_SYNC_ENABLED))
-        nvr_time_sync();
+    const int paused = (runctl_state() == RUN_PAUSED);
+    if (paused == was_paused)
+        return;
+    was_paused = paused;
 
-    do_pause(p);
-    if (p) {
+    if (paused) {
         strncpy(oldtitle, ui_window_title(NULL), sizeof(oldtitle) - 1);
         strcpy(title, oldtitle);
         strcat(title, " - PAUSED");

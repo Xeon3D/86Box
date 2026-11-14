@@ -233,6 +233,7 @@ extern int      confirm_reset;              /* (G) enable reset confirmation */
 extern int      confirm_exit;               /* (G) enable exit confirmation */
 extern int      confirm_save;               /* (G) enable save confirmation */
 extern int      chd_precache_level;         /* (G) CHD precache level */
+extern int      fast_forward_new_machines;  /* (G) New machines start in fast forward */
 extern int      force_10ms;                 /* (C) force 10ms CPU frame interval */
 extern int      jumpered_internal_ecp_dma;  /* (C) Jumpered internal EPC DMA */
 extern int      other_ide_present;          /* IDE controllers from non-IDE cards are present */
@@ -248,6 +249,7 @@ extern int    do_auto_pause;                /* (G) Auto-pause the emulator on fo
 extern int    do_auto_dialog_pause;         /* (G) Auto-pause the emulator on dialog boxes */
 extern int    auto_paused;
 extern int    force_constant_mouse;         /* (C) Force constant updating of the mouse */
+extern int    fast_forward_on_start;        /* (C) Start the machine in fast forward */
 extern double mouse_sensitivity;            /* (G) Mouse sensitivity scale */
 #ifdef _Atomic
 extern _Atomic double mouse_x_error;        /* Mouse error accumulator - Y */
@@ -298,7 +300,7 @@ extern void pclog(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 /* Optional per-line log callback for UI consumers (e.g. OSD log viewer). */
 extern void (*pclog_hook)(const char *line);
 extern void always_log(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
-extern void fatal(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
+extern void fatal(const char *fmt, ...) __attribute__ ((noreturn, format (printf, 1, 2)));
 extern void warning(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 extern void set_screen_size(int x, int y);
 extern void set_screen_size_monitor(int x, int y, int monitor_index);
@@ -335,11 +337,9 @@ extern void resub_cycles(int old_cycles);
 extern void sub_cycles_vx0(int c);
 extern void resub_cycles_vx0(int old_cycles);
 
-extern void ack_pause(void);
-extern void do_pause(int p);
-
 extern double isa_timing;
 extern int    io_delay;
+extern int    io_delay_multi;
 extern int    framecountx;
 
 extern volatile int     cpu_thread_run;

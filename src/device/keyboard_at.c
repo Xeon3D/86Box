@@ -5758,12 +5758,14 @@ keyboard_at_write(void *priv)
                     case 0x8a:
                         /* Sets 81h/82h/8Ah only exist on the Japanese 5576
                            keyboards; other keyboards answer resend and keep
-                           their current set (J-DOS then reports BIOS-102). */
+                           their current set (J-DOS then reports BIOS-102).
+                           Go back to scanning instead of waiting for another
+                           parameter: the host may give up after the resend
+                           (MS-DOS KEYB tries F0 82 three times, then sends
+                           nothing more), which would leave the keyboard dead. */
                         if ((val >= 0x81) && !dev->ps55) {
                             kbc_at_dev_queue_add(dev, 0xfe, 0); /* Resend */
                             keyboard_at_log("%s: Set scan code set [%02X] not supported - resend\n", dev->name, val);
-                            dev->flags |= FLAG_CTRLDAT;
-                            dev->state = DEV_STATE_MAIN_WANT_IN;
                             break;
                         }
                         kbc_at_dev_queue_add(dev, 0xfa, 0); /* ACK */
@@ -5816,6 +5818,20 @@ keyboard_at_write(void *priv)
         }
 
         switch (val) {
+            case 0xab: /* Request Keyboard ID */
+                if (dev->lk250) {
+                    /* The LK250 answers ABh with two bytes and no ACK: the version,
+                       then the mode (01h industry standard, 02h DIGITAL extended)
+                       (TRM 8-22/8-23). The VAXmate BIOS takes a valid answer as
+                       "clock present" when DOS asks through INT 15 AH=D0h, so
+                       without it the DOS date stays at 1-01-1980. */
+                    keyboard_at_log("%s: LK250: request keyboard ID\n", dev->name);
+                    kbc_at_dev_queue_add(dev, 0x01, 0); /* version */
+                    kbc_at_dev_queue_add(dev, 0x01, 0); /* industry standard mode */
+                } else
+                    kbc_at_dev_queue_add(dev, 0xfe, 0); /* Resend, as the default case. */
+                break;
+
             case 0xed: /* set/reset LEDs */
                 if ((dev->flags & FLAG_CTRLDAT) && (dev->command == 0xed))
                     keyboard_scan = 1;
@@ -6030,10 +6046,10 @@ keyboard_at_init(const device_t *info)
        Key 56  = Japanese key next to right shift, scan code:              5C (Backslash 73);
        Key 59  = Japanese key between left Ctrl and left Alt, scan code:   85 (Muhenkan 7B);
        Key 63  = Japanese key between right Ctrl and right Alt, scan code: 86 (Henkan/Zenkouho 79);
-       Key 65? = Japanese key between right Ctrl and right Alt, scan code: 87 (Hiragana/Katakana 70).
-     */
-    dev->type = (info->local & ~FLAG_PS55_KBD) | device_get_config_int("keys");
-    dev->ps55 = !!(info->local & FLAG_PS55_KBD);
+       Key 65? = Japanese key between right Ctrl and right Alt, scan code: 87 (Hiragana/Katakana 70). */
+    dev->type  = (info->local & ~(FLAG_PS55_KBD | FLAG_LK250_KBD)) | device_get_config_int("keys");
+    dev->ps55  = !!(info->local & FLAG_PS55_KBD);
+    dev->lk250 = !!(info->local & FLAG_LK250_KBD);
 
     /*
         We assume that the IBM PS/55 machine uses the 5576-002 keyboard (JP/CN layout) here.
@@ -6318,6 +6334,20 @@ const device_t keyboard_ps55_device = {
     .internal_name = "keyboard_ps55",
     .flags         = DEVICE_AT_KBC | DEVICE_PS2_KBC,
     .local         = FLAG_PS2_KBD | FLAG_PS55_KBD | KBD_JIS,
+    .init          = keyboard_at_init,
+    .close         = keyboard_at_close,
+    .reset         = NULL,
+    .available     = NULL,
+    .speed_changed = NULL,
+    .force_redraw  = NULL,
+    .config        = NULL
+};
+
+const device_t keyboard_lk250_device = {
+    .name          = "DEC LK250 Keyboard",
+    .internal_name = "keyboard_lk250",
+    .flags         = DEVICE_AT_KBC,
+    .local         = FLAG_LK250_KBD | KBD_102_KEY,
     .init          = keyboard_at_init,
     .close         = keyboard_at_close,
     .reset         = NULL,

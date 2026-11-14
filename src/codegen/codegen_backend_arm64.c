@@ -26,9 +26,7 @@
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
 #        include <stddef.h>
 #        include <86box/nmi.h>
-#        include <86box/pic.h>
 #        include <86box/timer.h>
-#        include "x86_interrupt.h"
 #    endif
 
 #    if defined(__linux__) || defined(__APPLE__)
@@ -64,6 +62,18 @@ void *codegen_ss_rout;
 void *codegen_exit_rout;
 void *codegen_rep_rout[2][3][2];
 
+/*Entries to the exit routines that take 1..n cycles off cycles first, one
+  per routine and count, so an exit that charges them keeps its single
+  branch and changes only its target (codegen_exit_dest). Nearly every
+  exit's charge is the instruction's own cycles and those of the few before
+  it; a larger one gets an arm in the block. Each is a veneer target too.*/
+#    define EXIT_CHARGED_EXIT 128
+#    define EXIT_CHARGED_GPF  64
+#    define EXIT_CHARGED_SS   32
+static void *codegen_exit_charged[EXIT_CHARGED_EXIT];
+static void *codegen_gpf_charged[EXIT_CHARGED_GPF];
+static void *codegen_ss_charged[EXIT_CHARGED_SS];
+
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
 codegen_link_slot_t codegen_link_slots[BLOCK_SIZE][CODEGEN_LINK_SLOTS];
 #    endif
@@ -73,6 +83,9 @@ static void *codegen_link_rout;
 static void *codegen_link_miss_rout;
 /*Exits emitted so far for the block being compiled; each gets its own slot*/
 static int link_site;
+/*The routine's branch to the set lookup, and where that comes back to*/
+static uint32_t *link_set_branch;
+static uint8_t  *link_set_return;
 #    endif
 
 host_reg_def_t codegen_host_reg_list[CODEGEN_HOST_REGS] = {
@@ -99,6 +112,64 @@ host_reg_def_t codegen_host_fp_reg_list[CODEGEN_HOST_FP_REGS] = {
     { REG_V15, 0}
 };
 
+/*A misaligned load that stays inside its page and has a read lookup: what
+  readmemwl(), readmemll() and readmemql() do on their in-page branch, the
+  timing_misaligned charge under the same Cyrix alignment rule and the load
+  through the lookup. A page crossing or a missing lookup branches to the C
+  path through to_c[0] and to_c[1].
+  In - W0 = address, X1 = readlookup2[] entry*/
+static void
+build_load_misaligned(codeblock_t *block, int size, int is_float, uint32_t **to_c)
+{
+    uint32_t *skip   = NULL;
+    uint32_t *charge = NULL;
+
+    /*The last byte is in the next page when bit 12 differs*/
+    host_arm64_ADD_IMM(block, REG_W2, REG_W0, size - 1);
+    host_arm64_EOR_REG(block, REG_W2, REG_W2, REG_W0, 0);
+    to_c[0] = host_arm64_TBNZ_SHORT_(block, REG_W2, 12);
+    host_arm64_CMPX_IMM(block, REG_X1, -1);
+    to_c[1] = host_arm64_BEQ_SHORT_(block);
+
+    /*readmem*l() clears high_page on every call; checkio()'s I/O map read
+      through readmemw_n() does not and would see a stale one*/
+    host_arm64_MOVX_IMM(block, REG_X2, (uint64_t) &high_page);
+    host_arm64_STRB_IMM(block, REG_WZR, REG_X2, 0);
+
+    if (size != 8) {
+        host_arm64_MOVX_IMM(block, REG_X2, (uint64_t) &cpu_cyrix_alignment);
+        host_arm64_LDR_IMM_W(block, REG_W2, REG_X2, 0);
+        charge = host_arm64_CBZ_SHORT_(block, REG_W2);
+        host_arm64_AND_IMM(block, REG_W2, REG_W0, 7);
+        if (size == 2) {
+            host_arm64_CMP_IMM(block, REG_W2, 7);
+            skip = host_arm64_BNE_SHORT_(block);
+        } else {
+            host_arm64_CMP_IMM(block, REG_W2, 4);
+            skip = host_arm64_BLE_SHORT_(block);
+        }
+        host_arm64_short_branch_set_offset(charge, &block_write_data[block_pos]);
+    }
+    host_arm64_MOVX_IMM(block, REG_X2, (uint64_t) &timing_misaligned);
+    host_arm64_LDR_IMM_W(block, REG_W2, REG_X2, 0);
+    codegen_direct_read_32(block, REG_W3, &cpu_state._cycles);
+    host_arm64_SUB_REG(block, REG_W3, REG_W3, REG_W2, 0);
+    codegen_direct_write_32(block, &cpu_state._cycles, REG_W3);
+    if (skip)
+        host_arm64_short_branch_set_offset(skip, &block_write_data[block_pos]);
+
+    if (size == 2)
+        host_arm64_LDRH_REG(block, REG_W0, REG_W1, REG_W0);
+    else if (size == 4 && !is_float)
+        host_arm64_LDR_REG(block, REG_W0, REG_W1, REG_W0);
+    else if (size == 4 && is_float)
+        host_arm64_LDR_REG_F32(block, REG_V_TEMP, REG_W1, REG_W0);
+    else
+        host_arm64_LDR_REG_F64(block, REG_V_TEMP, REG_W1, REG_W0);
+    host_arm64_MOVZ_IMM(block, REG_W1, 0);
+    host_arm64_RET(block, REG_X30);
+}
+
 /*ea_rule: take the direct load whenever the address is at most 0xffc into
   its page, aligned or not, as the interpreter's eal_r path does; readmemwl
   and readmemll charge timing_misaligned only on the slow path.*/
@@ -106,7 +177,9 @@ static void
 build_load_routine(codeblock_t *block, int size, int is_float, int ea_rule)
 {
     uint32_t *branch_offset;
-    uint32_t *misaligned_offset;
+    uint32_t *misaligned_offset = NULL;
+    uint32_t *to_c[2];
+    int       has_misaligned = !ea_rule && (size != 1);
 
     /*In - W0 = address
       Out - W0 = data, W1 = abrt*/
@@ -124,7 +197,10 @@ build_load_routine(codeblock_t *block, int size, int is_float, int ea_rule)
       LDP X29, X30, [SP, #-16]
       RET
     */
-    codegen_alloc(block, 80);
+    /*With the misaligned path, at most 55 instructions with every MOVX_IMM
+      at four and the C call through MOVX_IMM + BLR: one chunk, so the short
+      branches reach*/
+    codegen_alloc(block, has_misaligned ? 220 : 80);
     host_arm64_MOV_REG_LSR(block, REG_W1, REG_W0, 12);
     host_arm64_MOVX_IMM(block, REG_X2, (uint64_t) readlookup2);
     host_arm64_LDRX_REG_LSL3(block, REG_X1, REG_X2, REG_X1);
@@ -151,8 +227,14 @@ build_load_routine(codeblock_t *block, int size, int is_float, int ea_rule)
     host_arm64_MOVZ_IMM(block, REG_W1, 0);
     host_arm64_RET(block, REG_X30);
 
+    if (has_misaligned) {
+        host_arm64_branch_set_offset(misaligned_offset, &block_write_data[block_pos]);
+        build_load_misaligned(block, size, is_float, to_c);
+        host_arm64_short_branch_set_offset(to_c[0], &block_write_data[block_pos]);
+        host_arm64_short_branch_set_offset(to_c[1], &block_write_data[block_pos]);
+    }
     host_arm64_branch_set_offset(branch_offset, &block_write_data[block_pos]);
-    if (size != 1)
+    if (ea_rule)
         host_arm64_branch_set_offset(misaligned_offset, &block_write_data[block_pos]);
     host_arm64_STP_PREIDX_X(block, REG_X29, REG_X30, REG_XSP, -16);
     if (size == 1)
@@ -175,19 +257,33 @@ build_load_routine(codeblock_t *block, int size, int is_float, int ea_rule)
 }
 
 #    if !defined(USE_GDBSTUB)
-/*An aligned dword store to a RAM page whose writes are tracked (page_lookup):
-  what writememll() and mem_write_raml_page() do, without the two calls. The
-  dword never reaches the next 64-byte chunk, so only one dirty bit and one
-  byte-mask word change. writememll()'s addr64a[] is left alone: every user
-  fills it before reading it. Anything else returns through to_c[] to the C
-  path.
+/*An aligned byte, word or dword store to a RAM page whose writes are tracked
+  (page_lookup): what writemem*l() and mem_write_ram*_page() do, without the
+  two calls. The store never reaches the next 64-byte chunk, so only one dirty
+  bit and one byte-mask word change. writemem*l()'s addr64 and addr64a[] are
+  left alone: every user fills them before reading them. Anything else returns
+  through to_c[] to the C path.
   In - W0 = address, W1 = data. Returns the number of to_c[] branches.*/
 static int
-build_store_long_tracked(codeblock_t *block, uint32_t **to_c)
+build_store_tracked(codeblock_t *block, int size, uint32_t **to_c)
 {
     uint32_t *done[3];
     uint32_t *add_evict;
-    int       nr_to_c = 0;
+    int       nr_to_c   = 0;
+    int       byte_mask = (1 << size) - 1;
+    void     *write_fn;
+    int       write_offset;
+
+    if (size == 1) {
+        write_fn     = (void *) mem_write_ramb_page;
+        write_offset = offsetof(page_t, write_b);
+    } else if (size == 2) {
+        write_fn     = (void *) mem_write_ramw_page;
+        write_offset = offsetof(page_t, write_w);
+    } else {
+        write_fn     = (void *) mem_write_raml_page;
+        write_offset = offsetof(page_t, write_l);
+    }
 
     host_arm64_MOVX_IMM(block, REG_X3, (uint64_t) &codegen_in_recompile);
     host_arm64_LDR_IMM_W(block, REG_W3, REG_X3, 0);
@@ -205,8 +301,8 @@ build_store_long_tracked(codeblock_t *block, uint32_t **to_c)
     host_arm64_LDRX_REG_LSL3(block, REG_X4, REG_X3, REG_X2);
     host_arm64_CMPX_IMM(block, REG_X4, 0);
     to_c[nr_to_c++] = host_arm64_BEQ_(block);
-    host_arm64_LDR_IMM_X(block, REG_X5, REG_X4, offsetof(page_t, write_l));
-    host_arm64_MOVX_IMM(block, REG_X6, (uint64_t) mem_write_raml_page);
+    host_arm64_LDR_IMM_X(block, REG_X5, REG_X4, write_offset);
+    host_arm64_MOVX_IMM(block, REG_X6, (uint64_t) write_fn);
     host_arm64_CMPX_REG(block, REG_X5, REG_X6);
     to_c[nr_to_c++] = host_arm64_BNE_(block);
 
@@ -223,12 +319,25 @@ build_store_long_tracked(codeblock_t *block, uint32_t **to_c)
     host_arm64_MOVX_IMM(block, REG_X6, (uint64_t) &high_page);
     host_arm64_STRB_IMM(block, REG_WZR, REG_X6, 0);
 
-    /*Unchanged data: no store and no dirty bits*/
+    /*Unchanged data: no store and no dirty bits. The C functions take the
+      data as uint8_t or uint16_t, so only its low bits count.*/
     host_arm64_AND_IMM(block, REG_W6, REG_W0, 0xfff);
-    host_arm64_LDR_REG(block, REG_W7, REG_X5, REG_X6);
+    if (size == 1) {
+        host_arm64_AND_IMM(block, REG_W1, REG_W1, 0xff);
+        host_arm64_LDRB_REG(block, REG_W7, REG_X5, REG_X6);
+    } else if (size == 2) {
+        host_arm64_AND_IMM(block, REG_W1, REG_W1, 0xffff);
+        host_arm64_LDRH_REG(block, REG_W7, REG_X5, REG_X6);
+    } else
+        host_arm64_LDR_REG(block, REG_W7, REG_X5, REG_X6);
     host_arm64_CMP_REG(block, REG_W7, REG_W1);
     done[0] = host_arm64_BEQ_(block);
-    host_arm64_STR_REG(block, REG_W1, REG_X5, REG_X6);
+    if (size == 1)
+        host_arm64_STRB_REG(block, REG_W1, REG_X5, REG_X6);
+    else if (size == 2)
+        host_arm64_STRH_REG(block, REG_W1, REG_X5, REG_X6);
+    else
+        host_arm64_STR_REG(block, REG_W1, REG_X5, REG_X6);
 
     /*W6 = 64-byte chunk, X7 = its dirty_mask bit*/
     host_arm64_UBFX(block, REG_W6, REG_W0, 6, 6);
@@ -240,7 +349,7 @@ build_store_long_tracked(codeblock_t *block, uint32_t **to_c)
 
     /*W9 = byte in chunk, X10 = byte_mask, W13 = chunk word offset*/
     host_arm64_AND_IMM(block, REG_W9, REG_W0, 63);
-    host_arm64_MOVZ_IMM(block, REG_X10, 0xf);
+    host_arm64_MOVZ_IMM(block, REG_X10, byte_mask);
     host_arm64_LSLX(block, REG_X10, REG_X10, REG_X9);
     host_arm64_MOV_REG(block, REG_W13, REG_W6, 3);
     host_arm64_LDR_IMM_X(block, REG_X11, REG_X4, offsetof(page_t, byte_dirty_mask));
@@ -260,7 +369,7 @@ build_store_long_tracked(codeblock_t *block, uint32_t **to_c)
     host_arm64_LDR_IMM_X(block, REG_X12, REG_X4, offsetof(page_t, byte_code_present_mask));
     host_arm64_LDR_REG_X(block, REG_X12, REG_X12, REG_X13);
     host_arm64_LSRX(block, REG_X12, REG_X12, REG_X9);
-    host_arm64_TST_IMM(block, REG_W12, 0xf);
+    host_arm64_TST_IMM(block, REG_W12, byte_mask);
     done[2] = host_arm64_BEQ_(block);
     host_arm64_branch_set_offset(add_evict, &block_write_data[block_pos]);
     host_arm64_STP_PREIDX_X(block, REG_X29, REG_X30, REG_XSP, -16);
@@ -281,7 +390,7 @@ static void
 build_store_routine(codeblock_t *block, int size, int is_float)
 {
     uint32_t *branch_offset;
-    uint32_t *misaligned_offset;
+    uint32_t *misaligned_offset = NULL;
 
     /*In - R0 = address, R1 = data
       Out - R1 = abrt*/
@@ -324,9 +433,9 @@ build_store_routine(codeblock_t *block, int size, int is_float)
 
     host_arm64_branch_set_offset(branch_offset, &block_write_data[block_pos]);
 #    if !defined(USE_GDBSTUB)
-    if (size == 4 && !is_float) {
+    if (size <= 4 && !is_float) {
         uint32_t *to_c[6];
-        int       nr_to_c = build_store_long_tracked(block, to_c);
+        int       nr_to_c = build_store_tracked(block, size, to_c);
 
         for (int c = 0; c < nr_to_c; c++)
             host_arm64_branch_set_offset(to_c[c], &block_write_data[block_pos]);
@@ -460,6 +569,23 @@ rep_patch_list(uint32_t **list, int nr, void *dest)
 }
 
 static void
+rep_load_regs(codeblock_t *block, int is_stos, int a32)
+{
+    if (a32) {
+        host_arm64_LDR_IMM_W(block, REP_CNT, REG_CPUSTATE, rep_state_offset(&ECX));
+        if (!is_stos)
+            host_arm64_LDR_IMM_W(block, REP_SRC, REG_CPUSTATE, rep_state_offset(&ESI));
+        host_arm64_LDR_IMM_W(block, REP_DST, REG_CPUSTATE, rep_state_offset(&EDI));
+    } else {
+        host_arm64_LDRH_IMM(block, REP_CNT, REG_CPUSTATE, rep_state_offset(&CX));
+        if (!is_stos)
+            host_arm64_LDRH_IMM(block, REP_SRC, REG_CPUSTATE, rep_state_offset(&SI));
+        host_arm64_LDRH_IMM(block, REP_DST, REG_CPUSTATE, rep_state_offset(&DI));
+    }
+    host_arm64_LDR_IMM_W(block, REP_CYCLES, REG_CPUSTATE, rep_state_offset(&cpu_state._cycles));
+}
+
+static void
 rep_writeback(codeblock_t *block, int is_stos, int a32)
 {
     if (a32) {
@@ -476,10 +602,12 @@ rep_writeback(codeblock_t *block, int is_stos, int a32)
     host_arm64_STR_IMM_W(block, REP_CYCLES, REG_CPUSTATE, rep_state_offset(&cpu_state._cycles));
 }
 
-/*Sets W6 to 1 if the segment at base_reg + offset would fail the interpreter's
-  null selector or not-present check, using W2 = (msw & 1) && !(eflags & VM)*/
+/*Sets the slow flag if the segment at base_reg + offset would fail the
+  interpreter's null selector or not-present check, and for the segment written
+  its writability check (SEG_NOT_WRITABLE: writable bit clear, or a code segment
+  in protected mode), using W2 = (msw & 1) && !(eflags & VM)*/
 static void
-rep_seg_check(codeblock_t *block, int base_reg, int offset)
+rep_seg_check(codeblock_t *block, int base_reg, int offset, int write)
 {
     host_arm64_LDR_IMM_W(block, REG_W5, base_reg, offset + offsetof(x86seg, base));
     host_arm64_CMN_IMM(block, REG_W5, 1);
@@ -490,6 +618,15 @@ rep_seg_check(codeblock_t *block, int base_reg, int offset)
     host_arm64_TST_IMM(block, REG_W5, 0x80);
     host_arm64_CSEL_EQ(block, REG_W6, REG_W2, REG_WZR);
     host_arm64_ORR_REG(block, REP_SLOW, REP_SLOW, REG_W6, 0);
+    if (write) {
+        host_arm64_TST_IMM(block, REG_W5, 0x02);
+        host_arm64_CSET_NE(block, REG_W6);
+        host_arm64_EOR_IMM(block, REG_W6, REG_W6, 1);
+        host_arm64_ORR_REG(block, REP_SLOW, REP_SLOW, REG_W6, 0);
+        host_arm64_TST_IMM(block, REG_W5, 0x08);
+        host_arm64_CSEL_EQ(block, REG_W6, REG_WZR, REG_W2);
+        host_arm64_ORR_REG(block, REP_SLOW, REP_SLOW, REG_W6, 0);
+    }
 }
 
 /*Clamps W0 to W1 (unsigned)*/
@@ -615,7 +752,8 @@ rep_step_offset(codeblock_t *block, int off_reg, int delta_reg, int a32)
   In  - W0 = source segment offset in cpu_state (bits 0-11), cycle limit
              (bits 12-23), cycles per element (bits 24-31)
   Out - W0 = 0 to carry on with the block, non-zero to leave it with
-             cpu_state.pc set back to the instruction
+             cpu_state.pc set back to the instruction, or left at the next
+             one, which the caller sets, after an SMI on the last element
 
   Does what the interpreter's REP handlers in x86_ops_rep_dyn.h do: the same
   cycles per element, and the block ends at the same element when the string
@@ -623,10 +761,12 @@ rep_step_offset(codeblock_t *block, int off_reg, int delta_reg, int a32)
   runs that stay inside one source page and one destination page, both with
   direct lookups, inside both segment limits and inside the cycle budget, so a
   run does exactly what the interpreter's fast path does for each element.
-  Any other element goes through elem_func, which is the interpreter's loop
-  body for one element.*/
+  Any other element goes through run_func, which runs the interpreter's loop
+  for it and the elements after it up to the next one a run can copy, the end
+  of the count or the cycle limit, and leaves the registers and the cycle
+  count in cpu_state.*/
 static void
-build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*elem_func)(x86seg *seg))
+build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*run_func)(x86seg *seg, int32_t cycles_end))
 {
     int       size = 1 << shift;
     int       es_offset = rep_state_offset(&cpu_state.seg_es);
@@ -635,11 +775,13 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     uint32_t *to_done;
     uint32_t *to_break[2];
     uint32_t *to_abort;
+    uint32_t *to_smi;
     uint32_t *branch;
     uint32_t *branch2;
     uint8_t  *loop;
     uint8_t  *target;
     uint8_t  *done_ret;
+    uint8_t  *set_pc;
 
     /*Unpack the parameters*/
     host_arm64_UBFX(block, REG_W1, REG_W0, 12, 12);
@@ -650,18 +792,7 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     }
 
     /*Guest registers*/
-    if (a32) {
-        host_arm64_LDR_IMM_W(block, REP_CNT, REG_CPUSTATE, rep_state_offset(&ECX));
-        if (!is_stos)
-            host_arm64_LDR_IMM_W(block, REP_SRC, REG_CPUSTATE, rep_state_offset(&ESI));
-        host_arm64_LDR_IMM_W(block, REP_DST, REG_CPUSTATE, rep_state_offset(&EDI));
-    } else {
-        host_arm64_LDRH_IMM(block, REP_CNT, REG_CPUSTATE, rep_state_offset(&CX));
-        if (!is_stos)
-            host_arm64_LDRH_IMM(block, REP_SRC, REG_CPUSTATE, rep_state_offset(&SI));
-        host_arm64_LDRH_IMM(block, REP_DST, REG_CPUSTATE, rep_state_offset(&DI));
-    }
-    host_arm64_LDR_IMM_W(block, REP_CYCLES, REG_CPUSTATE, rep_state_offset(&cpu_state._cycles));
+    rep_load_regs(block, is_stos, a32);
 
     /*Cycle count at which the loop stops: one element only with the trap flag set*/
     host_arm64_SUB_REG(block, REP_END, REP_CYCLES, REG_W1, 0);
@@ -689,9 +820,9 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     host_arm64_LDRH_IMM(block, REG_W5, REG_CPUSTATE, rep_state_offset(&cpu_state.eflags));
     host_arm64_TST_IMM(block, REG_W5, VM_FLAG);
     host_arm64_CSEL_EQ(block, REG_W2, REG_W2, REG_WZR);
-    rep_seg_check(block, REG_CPUSTATE, es_offset);
+    rep_seg_check(block, REG_CPUSTATE, es_offset, 1);
     if (!is_stos)
-        rep_seg_check(block, REP_SEG, 0);
+        rep_seg_check(block, REP_SEG, 0, 0);
 
     /*Lookup tables, and the value to store*/
     if (!is_stos)
@@ -891,7 +1022,7 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     to_break[0] = host_arm64_BLT_(block);
     host_arm64_B(block, loop);
 
-    /*One element through the interpreter's loop body*/
+    /*Elements through the interpreter's loop*/
     rep_patch_list(slow, nr_slow, &block_write_data[block_pos]);
     rep_writeback(block, is_stos, a32);
     host_arm64_STP_PREIDX_X(block, REG_X29, REG_X30, REG_XSP, -16);
@@ -902,7 +1033,8 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     host_arm64_STP_PREIDX_X(block, REG_X14, REG_X15, REG_XSP, -16);
     host_arm64_STP_PREIDX_X(block, REG_X17, REG_X1, REG_XSP, -16);
     host_arm64_MOVX_REG(block, REG_X0, REP_SEG, 0);
-    host_arm64_call(block, (void *) elem_func);
+    host_arm64_MOV_REG(block, REG_W1, REP_END, 0);
+    host_arm64_call(block, (void *) run_func);
     host_arm64_LDP_POSTIDX_X(block, REG_X17, REG_X1, REG_XSP, 16);
     host_arm64_LDP_POSTIDX_X(block, REG_X14, REG_X15, REG_XSP, 16);
     host_arm64_LDP_POSTIDX_X(block, REG_X12, REG_X13, REG_XSP, 16);
@@ -910,15 +1042,16 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     host_arm64_LDP_POSTIDX_X(block, REG_X8, REG_X9, REG_XSP, 16);
     host_arm64_LDP_POSTIDX_X(block, REG_X3, REG_X4, REG_XSP, 16);
     host_arm64_LDP_POSTIDX_X(block, REG_X29, REG_X30, REG_XSP, 16);
-    /*A misaligned access charges extra cycles*/
-    host_arm64_LDR_IMM_W(block, REP_CYCLES, REG_CPUSTATE, rep_state_offset(&cpu_state._cycles));
+    /*The call has stepped the guest registers and the cycle count*/
+    rep_load_regs(block, is_stos, a32);
     host_arm64_CMP_IMM(block, REG_W0, 0);
     to_abort = host_arm64_BNE_(block);
-    if (!is_stos)
-        rep_step_offset(block, REP_SRC, REP_STEP, a32);
-    rep_step_offset(block, REP_DST, REP_STEP, a32);
-    host_arm64_SUB_IMM(block, REP_CNT, REP_CNT, 1);
-    host_arm64_SUB_REG(block, REP_CYCLES, REP_CYCLES, REP_ELEMCYC, 0);
+    /*An element that raised an SMI (a trapped write) ends the instruction,
+      as the interpreter's loop does. Only these elements can: the runs copy
+      RAM through direct lookups, which nothing traps.*/
+    host_arm64_LDRB_IMM_W(block, REG_W0, REG_CPUSTATE, rep_state_offset(&cpu_state._smi_line));
+    host_arm64_CMP_IMM(block, REG_W0, 0);
+    to_smi = host_arm64_BNE_(block);
     host_arm64_CMP_REG(block, REP_CYCLES, REP_END);
     to_break[1] = host_arm64_BLT_(block);
     host_arm64_B(block, loop);
@@ -944,8 +1077,19 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
     rep_writeback(block, is_stos, a32);
 
     host_arm64_branch_set_offset(branch, &block_write_data[block_pos]);
+    set_pc = &block_write_data[block_pos];
     host_arm64_LDR_IMM_W(block, REG_W1, REG_CPUSTATE, rep_state_offset(&cpu_state.oldpc));
     host_arm64_STR_IMM_W(block, REG_W1, REG_CPUSTATE, rep_state_offset(&cpu_state.pc));
+    host_arm64_mov_imm(block, REG_W0, 1);
+    host_arm64_RET(block, REG_X30);
+
+    /*SMI: leave the block for it, restarting the instruction if elements are
+      left, otherwise after it, where the caller has set cpu_state.pc*/
+    host_arm64_branch_set_offset(to_smi, &block_write_data[block_pos]);
+    rep_writeback(block, is_stos, a32);
+    host_arm64_CMP_IMM(block, REP_CNT, 0);
+    branch = host_arm64_BNE_(block);
+    host_arm64_branch_set_offset(branch, set_pc);
     host_arm64_mov_imm(block, REG_W0, 1);
     host_arm64_RET(block, REG_X30);
 
@@ -954,43 +1098,151 @@ build_rep_routine(codeblock_t *block, int is_stos, int shift, int a32, int (*ele
 }
 
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
-/*Literal pool entries, in the pairs the routine loads together with LDP*/
-enum {
-    LINK_LIT_WAS_RESET,
-    LINK_LIT_FLUSH_PENDING,
-    LINK_LIT_CPU_INIT,
-    LINK_LIT_NEW_NE,
-    LINK_LIT_NMI_ENABLE,
-    LINK_LIT_FORCE_INTERPRETER,
-    LINK_LIT_OVERRIDE_DYNAREC,
-    LINK_LIT_NMI,
-    LINK_LIT_PIC,
-    LINK_LIT_CUR_STATUS,
-    LINK_LIT_TSC,
-    LINK_LIT_TSC_OLD,
-    LINK_LIT_CYCLES_OLD,
-    LINK_LIT_TIMER_TARGET,
-    LINK_LIT_GET_PHYS_VIRT,
-    LINK_LIT_GET_PHYS_PHYS,
-    LINK_LIT_OLDCS,
-    LINK_LIT_OLDCPL,
-    LINK_LIT_FETCH_DEVICE,
-    LINK_LIT_CPU_HALTED,
-    LINK_LIT_NMI_MASK,
-    LINK_LIT_RAMMASK,
-    LINK_LIT_READLOOKUP2,
-    LINK_LIT_RAM,
-    LINK_LIT_DR_ARMED,
-    LINK_LIT_IOAPIC_PATH,
-    LINK_LIT_LAPIC_EXTINT,
-    LINK_LIT_LAPIC_IRR,
-
-    LINK_LIT_COUNT
-};
-
 #        define LINK_SLOT(field) ((int) offsetof(codegen_link_slot_t, field))
-#        define LINK_LIT(nr)     ((nr) * 8)
 #        define LINK_MAX_MISS    32
+
+/*The globals the link routine reads and writes, addressed from the PC when
+  they are within ADRP's reach of the routine (every global in one page
+  window, decided once when the routine is built), else loaded from a pool
+  of addresses after the routine's code: one instruction each, whatever the
+  address, so the routine fits its allocator block either way.*/
+static const void *const link_globals[] = {
+    &cpu_events, &nmi_enable, &nmi_mask, &cpu_cur_status, &tsc, &tsc_old, &cycles_old, &timer_target,
+    &get_phys_virt, &get_phys_phys, &oldcs, &oldcpl, &cpu_fetch_device, &rammask, readlookup2, &ram
+};
+static int link_adrp;
+
+/*The globals of the hit path, whose pages (or, from the pool, addresses)
+  are loaded once into registers no block keeps anything in across its
+  exit: everything is written back before the branch here, the next block
+  starts with no register allocated, and a miss restores them from the
+  frame*/
+static const void *const link_hit_globals[] = {
+    &cpu_events, &cpu_cur_status, &tsc, &tsc_old, &cycles_old, &timer_target,
+    &get_phys_virt, &get_phys_phys, &oldcs, &oldcpl, &cpu_fetch_device
+};
+static const int link_base_regs[] = { REG_X19, REG_X20, REG_X21, REG_X22, REG_X23, REG_X24, REG_X25, REG_X26, REG_X27, REG_X28 };
+#        define LINK_MAX_BASES ((int) (sizeof(link_base_regs) / sizeof(link_base_regs[0])))
+static uintptr_t link_base_key[LINK_MAX_BASES];
+static int       link_base_nr;
+
+#        define LINK_MAX_POOL 32
+static uint32_t   *link_pool_ref[LINK_MAX_POOL];
+static const void *link_pool_ptr[LINK_MAX_POOL];
+static int         link_pool_nr;
+
+/*X<reg> = the page of ptr (ADRP) or ptr itself; returns the offset the load
+  or store adds to it*/
+static int
+link_addr(codeblock_t *block, int reg, const void *ptr)
+{
+    if (link_adrp) {
+        host_arm64_ADRP(block, reg, (uintptr_t) ptr);
+        return (int) ((uintptr_t) ptr & 0xfff);
+    }
+    if (link_pool_nr >= LINK_MAX_POOL)
+        fatal("build_link_routine - too many pooled addresses\n");
+    host_arm64_LDR_LITERAL_X(block, reg, 0);
+    link_pool_ref[link_pool_nr] = (uint32_t *) &block_write_data[block_pos - 4];
+    link_pool_ptr[link_pool_nr++] = ptr;
+    return 0;
+}
+
+/*The pool, after the routine's code and in its allocator block: one 8-byte
+  entry per address, and every load pointed at its entry*/
+static void
+link_pool_emit(void)
+{
+    uint8_t *entry[LINK_MAX_POOL];
+
+    block_pos = (block_pos + 7) & ~7;
+    for (int c = 0; c < link_pool_nr; c++) {
+        const uint64_t addr = (uintptr_t) link_pool_ptr[c];
+        int            d;
+
+        for (d = 0; d < c; d++) {
+            if (link_pool_ptr[d] == link_pool_ptr[c])
+                break;
+        }
+        if (d < c) {
+            entry[c] = entry[d];
+            continue;
+        }
+        if (block_pos + 8 > BLOCK_MAX)
+            fatal("build_link_routine - address pool does not fit in the allocator block\n");
+        entry[c] = &block_write_data[block_pos];
+        memcpy(entry[c], &addr, 8);
+        block_pos += 8;
+    }
+    for (int c = 0; c < link_pool_nr; c++)
+        host_arm64_short_branch_set_offset(link_pool_ref[c], entry[c]);
+}
+
+/*X<reg> = ptr itself*/
+static void
+link_addr_exact(codeblock_t *block, int reg, const void *ptr)
+{
+    int offset = link_addr(block, reg, ptr);
+
+    if (offset)
+        host_arm64_ADDX_IMM(block, reg, reg, offset);
+}
+
+static uintptr_t
+link_base_of(const void *ptr)
+{
+    return link_adrp ? ((uintptr_t) ptr & ~(uintptr_t) 0xfff) : (uintptr_t) ptr;
+}
+
+/*One base register per page (or pooled address) of link_hit_globals, while
+  registers last*/
+static void
+link_bases_load(codeblock_t *block)
+{
+    link_base_nr = 0;
+    for (size_t c = 0; c < sizeof(link_hit_globals) / sizeof(link_hit_globals[0]); c++) {
+        const uintptr_t key = link_base_of(link_hit_globals[c]);
+        int             d;
+
+        for (d = 0; d < link_base_nr; d++) {
+            if (link_base_key[d] == key)
+                break;
+        }
+        if ((d < link_base_nr) || (link_base_nr == LINK_MAX_BASES))
+            continue;
+        link_base_key[link_base_nr] = key;
+        (void) link_addr(block, link_base_regs[link_base_nr], link_hit_globals[c]);
+        link_base_nr++;
+    }
+}
+
+/*The register to address ptr from, and in *offset what to add: a base
+  register if ptr's page has one, else X<reg> loaded as link_addr() does*/
+static int
+link_base(codeblock_t *block, int reg, const void *ptr, int *offset)
+{
+    const uintptr_t key = link_base_of(ptr);
+
+    for (int d = 0; d < link_base_nr; d++) {
+        if (link_base_key[d] == key) {
+            *offset = link_adrp ? (int) ((uintptr_t) ptr & 0xfff) : 0;
+            return link_base_regs[d];
+        }
+    }
+    *offset = link_addr(block, reg, ptr);
+    return reg;
+}
+
+/*The event flags are read as two 64-bit words and OR-ed into one test;
+  halted is the top half of the last word and is shifted out of it*/
+_Static_assert(offsetof(cpu_events_t, flush_pending) == 4 && offsetof(cpu_events_t, init) == 8
+                   && offsetof(cpu_events_t, ne) == 12 && offsetof(cpu_events_t, force_interpreter) == 16
+                   && offsetof(cpu_events_t, override_dynarec) == 20 && offsetof(cpu_events_t, dr_armed) == 24
+                   && offsetof(cpu_events_t, halted) == 28 && offsetof(cpu_events_t, stpclk) == 48
+                   && offsetof(cpu_events_t, throttle_run) == 52 && sizeof(cpu_events_t) == 56,
+               "cpu_events is loaded as two pairs of 64-bit words");
+_Static_assert(offsetof(codeblock_t, runs_left) == offsetof(codeblock_t, used) + 1 && !(offsetof(codeblock_t, used) & 1),
+               "used and runs_left are loaded as one halfword");
 
 /*Fields the routine loads together, with LDP or one wider load*/
 _Static_assert(offsetof(codegen_link_slot_t, exit_cs) == offsetof(codegen_link_slot_t, exit_pc) + 4
@@ -1030,22 +1282,22 @@ _Static_assert(BLOCK_SIZE <= 0x10000, "block numbers and codeblock_hash entries 
   it does the stores the C loop would have done and jumps to the next
   block's link entry, which runs on the frame this block's prologue built.
 
-  Global addresses come from a literal pool placed just before the routine,
-  so the routine and the pool must share one allocator block. Loads are
-  paired wherever the layout allows, since on a hit the routine is limited
-  by how many loads it issues rather than by its length.*/
+  Globals are addressed from the PC (link_addr), the hit path's from base
+  registers loaded once (link_bases_load()), so no load is spent on an
+  address. On a hit the routine is limited by how many instructions and
+  stores it issues; its loads are nearly free, and are paired wherever the
+  layout allows.*/
 static void
 build_link_routine(codeblock_t *block)
 {
-    uint64_t *lit;
     uint8_t  *start_data;
     uint32_t *miss[LINK_MAX_MISS];
     int       nr_miss = 0;
+    uint32_t *key_miss;
     uint32_t *nmi_set;
     uint32_t *nmi_ok;
     uint32_t *irq_ok;
-    uint32_t *irq_ok_2;
-    uint32_t *es_flat;
+    uint32_t *used_set;
     uint32_t *uncached;
     uint32_t *no_paging;
     uint32_t *cached;
@@ -1054,54 +1306,42 @@ build_link_routine(codeblock_t *block)
     uint32_t *byte_mask;
     uint32_t *no_paging_2;
     uint8_t  *nmi_done;
+    uint8_t  *irq_done;
     uint8_t  *xlat_done;
     uint8_t  *two_page_done;
     uint8_t  *xlat_2_done;
     uint8_t  *miss_dest;
+    int       off_tsc;
+    int       off_tsc_old;
+    int       off_cycles_old;
+    int       off_virt;
+    int       off_phys;
+    int       off_events;
+    int       offset;
+    int       base;
+    int       base_tsc;
+    int       base_tsc_old;
+    int       base_cycles_old;
+    int       base_virt;
+    int       base_phys;
 
     /*Start a fresh allocator block, so nothing below is split across two*/
     codegen_alloc(block, BLOCK_MAX - 4);
-    if (block_pos & 7)
-        block_pos += 4;
     start_data = block_write_data;
-    lit        = (uint64_t *) &block_write_data[block_pos];
-    block_pos += LINK_LIT_COUNT * 8;
 
-    lit[LINK_LIT_WAS_RESET]         = (uint64_t) (uintptr_t) &x86_was_reset;
-    lit[LINK_LIT_FLUSH_PENDING]     = (uint64_t) (uintptr_t) &cpu_flush_pending;
-    lit[LINK_LIT_CPU_INIT]          = (uint64_t) (uintptr_t) &cpu_init;
-    lit[LINK_LIT_NEW_NE]            = (uint64_t) (uintptr_t) &new_ne;
-    lit[LINK_LIT_CPU_HALTED]        = (uint64_t) (uintptr_t) &cpu_halted;
-    lit[LINK_LIT_FORCE_INTERPRETER] = (uint64_t) (uintptr_t) &cpu_force_interpreter;
-    lit[LINK_LIT_OVERRIDE_DYNAREC]  = (uint64_t) (uintptr_t) &cpu_override_dynarec;
-    lit[LINK_LIT_NMI]               = (uint64_t) (uintptr_t) &nmi;
-    lit[LINK_LIT_PIC]               = (uint64_t) (uintptr_t) &pic;
-    lit[LINK_LIT_CUR_STATUS]        = (uint64_t) (uintptr_t) &cpu_cur_status;
-    lit[LINK_LIT_TSC]               = (uint64_t) (uintptr_t) &tsc;
-    lit[LINK_LIT_TSC_OLD]           = (uint64_t) (uintptr_t) &tsc_old;
-    lit[LINK_LIT_CYCLES_OLD]        = (uint64_t) (uintptr_t) &cycles_old;
-    lit[LINK_LIT_TIMER_TARGET]      = (uint64_t) (uintptr_t) &timer_target;
-    lit[LINK_LIT_GET_PHYS_VIRT]     = (uint64_t) (uintptr_t) &get_phys_virt;
-    lit[LINK_LIT_GET_PHYS_PHYS]     = (uint64_t) (uintptr_t) &get_phys_phys;
-    lit[LINK_LIT_OLDCS]             = (uint64_t) (uintptr_t) &oldcs;
-    lit[LINK_LIT_OLDCPL]            = (uint64_t) (uintptr_t) &oldcpl;
-    lit[LINK_LIT_FETCH_DEVICE]      = (uint64_t) (uintptr_t) &cpu_fetch_device;
-    lit[LINK_LIT_NMI_ENABLE]        = (uint64_t) (uintptr_t) &nmi_enable;
-    lit[LINK_LIT_NMI_MASK]          = (uint64_t) (uintptr_t) &nmi_mask;
-    lit[LINK_LIT_RAMMASK]           = (uint64_t) (uintptr_t) &rammask;
-    lit[LINK_LIT_READLOOKUP2]       = (uint64_t) (uintptr_t) readlookup2;
-    lit[LINK_LIT_RAM]               = (uint64_t) (uintptr_t) &ram;
-    lit[LINK_LIT_DR_ARMED]          = (uint64_t) (uintptr_t) &cpu_dr_armed;
-    lit[LINK_LIT_IOAPIC_PATH]       = (uint64_t) (uintptr_t) &ioapic_irq_path_active;
-    lit[LINK_LIT_LAPIC_EXTINT]      = (uint64_t) (uintptr_t) &cpu_lapic_extint_live[0];
-    lit[LINK_LIT_LAPIC_IRR]         = (uint64_t) (uintptr_t) &cpu_lapic_irr_live;
+    link_adrp = 1;
+    for (size_t c = 0; c < sizeof(link_globals) / sizeof(link_globals[0]); c++) {
+        if (!host_arm64_ADRP_in_range((uintptr_t) link_globals[c] - 0x1000)
+            || !host_arm64_ADRP_in_range((uintptr_t) link_globals[c] + 0x1000))
+            link_adrp = 0;
+    }
+    link_pool_nr = 0;
 
     codegen_link_rout = &block_write_data[block_pos];
 
-    /*X17 = the literal pool. X1 = the exit's slot, whose exit_pc and exit_cs
-      must match cpu_state.pc and the CS base and whose entry must be set;
-      X15 = its entry; W2 = cs + pc*/
-    host_arm64_ADR(block, REG_X17, (int) ((uintptr_t) lit - (uintptr_t) &block_write_data[block_pos]));
+    /*X1 = the exit's slot, whose exit_pc and exit_cs must match cpu_state.pc
+      and the CS base and whose entry must be set; X15 = its entry;
+      W2 = cs + pc*/
     host_arm64_LDR_IMM_W(block, REG_W2, REG_CPUSTATE, rep_state_offset(&cpu_state.pc));
     host_arm64_LDR_IMM_W(block, REG_W3, REG_CPUSTATE, rep_state_offset(&cpu_state.seg_cs.base));
     host_arm64_LDP_IMM_X(block, REG_X5, REG_X15, REG_X0, LINK_SLOT(exit_pc));
@@ -1109,91 +1349,70 @@ build_link_routine(codeblock_t *block)
     host_arm64_ADD_REG(block, REG_W2, REG_W2, REG_W3, 0);
     host_arm64_MOVX_REG(block, REG_X1, REG_X0, 0);
     host_arm64_CMPX_REG(block, REG_X5, REG_X4);
-    miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
+    key_miss        = host_arm64_BNE_SHORT_(block);
+    link_set_return = &block_write_data[block_pos];
+    link_bases_load(block);
     miss[nr_miss++] = host_arm64_CBZ_SHORT_(block, REG_X15);
 
-    /*Target not freed or changed since the slot was filled. W6 = the slot's
-      status | npxc << 16*/
-    host_arm64_LDR_IMM_X(block, REG_X4, REG_X1, LINK_SLOT(block));
+    /*Target not freed or changed since the slot was filled. X16 = the
+      target block, W6 = the slot's status | npxc << 16*/
+    host_arm64_LDR_IMM_X(block, REG_X16, REG_X1, LINK_SLOT(block));
     host_arm64_LDP_IMM_W(block, REG_W5, REG_W6, REG_X1, LINK_SLOT(gen));
-    host_arm64_LDR_IMM_W(block, REG_W4, REG_X4, offsetof(codeblock_t, link_gen));
+    host_arm64_LDR_IMM_W(block, REG_W4, REG_X16, offsetof(codeblock_t, link_gen));
     host_arm64_CMP_REG(block, REG_W4, REG_W5);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
 
     /*Nothing pending for the loop, and the loop would pick the recompiler.
       An armed debug breakpoint is a miss, so the loop makes its per-block
-      check (dr_blocks_cache()). W7 = abrt and smi_line in its top half,
-      W14 = cycles, X12 = &nmi*/
+      check (dr_blocks_cache()). The seven event flags are the two pairs
+      loaded from cpu_events, with halted shifted out of the last word;
+      W7 = abrt and smi_line in its top half, W14 = cycles, W12 = nmi,
+      W17 = irq. Clock control (stpclk and throttle_run, X10) is a miss too:
+      the loop stops the processor or stalls it after each block while it
+      is on, and a P_LVL2/P_LVL3 read by INS does not end its block*/
     host_arm64_LDP_IMM_W(block, REG_W7, REG_W14, REG_CPUSTATE, rep_state_offset(&cpu_state.abrt) - 2);
-    host_arm64_LDR_IMM_X(block, REG_X13, REG_X17, LINK_LIT(LINK_LIT_DR_ARMED));
-    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X17, LINK_LIT(LINK_LIT_WAS_RESET));
-    host_arm64_LDP_IMM_X(block, REG_X5, REG_X8, REG_X17, LINK_LIT(LINK_LIT_CPU_INIT));
-    /*X9 = &nmi_enable, loaded only as the pair of the next entry*/
-    host_arm64_LDP_IMM_X(block, REG_X9, REG_X10, REG_X17, LINK_LIT(LINK_LIT_NMI_ENABLE));
-    host_arm64_LDP_IMM_X(block, REG_X11, REG_X12, REG_X17, LINK_LIT(LINK_LIT_OVERRIDE_DYNAREC));
-    host_arm64_LDR_IMM_W(block, REG_W3, REG_X3, 0);
-    host_arm64_LDR_IMM_W(block, REG_W4, REG_X4, 0);
-    host_arm64_LDR_IMM_W(block, REG_W5, REG_X5, 0);
-    host_arm64_LDR_IMM_W(block, REG_W8, REG_X8, 0);
-    host_arm64_LDR_IMM_W(block, REG_W10, REG_X10, 0);
-    host_arm64_LDR_IMM_W(block, REG_W11, REG_X11, 0);
-    host_arm64_LDR_IMM_W(block, REG_W13, REG_X13, 0);
+    base = link_base(block, REG_X9, &cpu_events, &off_events);
+    /*ADDX_IMM emits nothing for an offset of 0*/
+    if (off_events)
+        host_arm64_ADDX_IMM(block, REG_X9, base, off_events);
+    else if (base != REG_X9)
+        host_arm64_MOVX_REG(block, REG_X9, base, 0);
+    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X9, 0);
+    host_arm64_LDP_IMM_X(block, REG_X5, REG_X8, REG_X9, 16);
+    host_arm64_LDR_IMM_W(block, REG_W12, REG_X9, offsetof(cpu_events_t, nmi_req));
+    host_arm64_LDRB_IMM_W(block, REG_W17, REG_X9, offsetof(cpu_events_t, irq));
+    host_arm64_LDR_IMM_X(block, REG_X10, REG_X9, offsetof(cpu_events_t, stpclk));
     host_arm64_AND_IMM(block, REG_W7, REG_W7, 0xffff0000);
-    host_arm64_ORR_REG(block, REG_W3, REG_W3, REG_W4, 0);
-    host_arm64_ORR_REG(block, REG_W5, REG_W5, REG_W8, 0);
-    host_arm64_ORR_REG(block, REG_W7, REG_W7, REG_W11, 0);
-    host_arm64_ORR_REG(block, REG_W3, REG_W3, REG_W5, 0);
-    host_arm64_ORR_REG(block, REG_W7, REG_W7, REG_W10, 0);
-    host_arm64_ORR_REG(block, REG_W5, REG_W5, REG_W13, 0);
-    host_arm64_ORR_REG(block, REG_W3, REG_W3, REG_W7, 0);
-    miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_W3);
+    host_arm64_ORRX_REG(block, REG_X3, REG_X3, REG_X10, 0);
+    host_arm64_ORRX_REG(block, REG_X3, REG_X3, REG_X4, 0);
+    host_arm64_ORRX_REG(block, REG_X5, REG_X5, REG_X7, 0);
+    host_arm64_ORRX_REG(block, REG_X3, REG_X3, REG_X8, 32);
+    host_arm64_ORRX_REG(block, REG_X3, REG_X3, REG_X5, 0);
+    miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_X3);
 
-    /*NMI_TAKEABLE(): nmi && nmi_enable && (nmi_mask || (nmi & 2)); the
-      rest is out of line, with W12 = nmi*/
-    host_arm64_LDR_IMM_W(block, REG_W12, REG_X12, 0);
+    /*NMI_TAKEABLE(): nmi here, the rest out of line*/
     nmi_set  = host_arm64_CBNZ_SHORT_(block, REG_W12);
     nmi_done = &block_write_data[block_pos];
 
-    /*Trap flag, and an interrupt the loop would take. X13 = CR0 | flags << 32*/
+    /*Trap flag, and an interrupt the loop would take. The loop looks for
+      one only while irq (0 or 1) is set, so with IF set that is a miss;
+      with IF clear it takes none. X13 = CR0 | flags << 32*/
     host_arm64_LDR_IMM_X(block, REG_X13, REG_CPUSTATE, rep_state_offset(&cpu_state.CR0.l));
-    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X17, LINK_LIT(LINK_LIT_PIC));
     miss[nr_miss++] = host_arm64_TBNZ_SHORT_(block, REG_X13, 32 + 8);
     irq_ok          = host_arm64_TBZ_SHORT_(block, REG_X13, 32 + 9);
-    host_arm64_LDRB_IMM_W(block, REG_W5, REG_X3, offsetof(pic_t, int_pending));
-    miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_W5);
-    /*With the IOAPIC routing interrupts, x86_external_interrupt_pending()
-      also looks at local APIC 0: an ExtINT or anything in its IRR is a
-      miss, and the C loop works out whether it is deliverable*/
-    host_arm64_LDR_IMM_X(block, REG_X5, REG_X17, LINK_LIT(LINK_LIT_IOAPIC_PATH));
-    host_arm64_LDRB_IMM_W(block, REG_W5, REG_X5, 0);
-    irq_ok_2 = host_arm64_CBZ_SHORT_(block, REG_W5);
-    host_arm64_LDR_IMM_X(block, REG_X5, REG_X17, LINK_LIT(LINK_LIT_LAPIC_EXTINT));
-    host_arm64_LDRB_IMM_W(block, REG_W5, REG_X5, 0);
-    miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_W5);
-    host_arm64_LDR_IMM_X(block, REG_X5, REG_X17, LINK_LIT(LINK_LIT_LAPIC_IRR));
-    host_arm64_LDR_IMM_W(block, REG_W5, REG_X5, 0);
-    miss[nr_miss++] = host_arm64_TBNZ_SHORT_(block, REG_W5, 0);
-    host_arm64_short_branch_set_offset(irq_ok, &block_write_data[block_pos]);
-    host_arm64_short_branch_set_offset(irq_ok_2, &block_write_data[block_pos]);
+    miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_W17);
+    irq_done        = &block_write_data[block_pos];
+    host_arm64_short_branch_set_offset(irq_ok, irq_done);
 
     /*Status and FPU rounding as when the slot was filled, compared as one
       word against W6. Only the C loop refreshes the PC24 and RC_NZ status
       bits from npxc, so they can be stale after an FLDCW in a linked block;
       the npxc compare decides them instead. Everything else that reads
-      those two bits runs after that refresh. The C loop also sets NOTFLATES
-      from ES before each lookup, and not every ES load keeps it current, so
-      it is worked out again here from ES itself: W8 = 0 if ES is flat.*/
-    host_arm64_LDRH_IMM(block, REG_W4, REG_X4, 0);
-    host_arm64_AND_IMM(block, REG_W4, REG_W4, ~(uint32_t) CPU_STATUS_NOTFLATES);
-    host_arm64_LDR_IMM_W(block, REG_W8, REG_CPUSTATE, rep_state_offset(&cpu_state.seg_es.base));
-    host_arm64_LDR_IMM_W(block, REG_W9, REG_CPUSTATE, rep_state_offset(&cpu_state.seg_es.limit_low));
-    host_arm64_LDR_IMM_W(block, REG_W10, REG_CPUSTATE, rep_state_offset(&cpu_state.seg_es.limit_high));
-    host_arm64_ADD_IMM(block, REG_W10, REG_W10, 1);
-    host_arm64_ORR_REG(block, REG_W8, REG_W8, REG_W9, 0);
-    host_arm64_ORR_REG(block, REG_W8, REG_W8, REG_W10, 0);
-    es_flat = host_arm64_CBZ_SHORT_(block, REG_W8);
-    host_arm64_ORR_IMM(block, REG_W4, REG_W4, CPU_STATUS_NOTFLATES);
-    host_arm64_short_branch_set_offset(es_flat, &block_write_data[block_pos]);
+      those two bits runs after that refresh. NOTFLATES is compared as
+      stored, since every write to the ES base or limits brings it in line
+      before the next lookup.*/
+    base = link_base(block, REG_X4, &cpu_cur_status, &offset);
+    host_arm64_LDRH_IMM(block, REG_W4, base, offset);
     host_arm64_LDRH_IMM(block, REG_W5, REG_CPUSTATE, rep_state_offset(&cpu_state.npxc));
     host_arm64_AND_IMM(block, REG_W5, REG_W5, 0x0f00);
     host_arm64_ORR_REG(block, REG_W4, REG_W4, REG_W5, 16);
@@ -1202,21 +1421,23 @@ build_link_routine(codeblock_t *block)
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
 
     /*The TSC. If it moved, update_tsc() ran inside the block and the C loop
-      does the rest of that arithmetic. X3 = &tsc, X11 = new tsc,
-      X4 = &tsc_old, X5 = &cycles_old*/
-    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X17, LINK_LIT(LINK_LIT_TSC));
-    host_arm64_LDP_IMM_X(block, REG_X5, REG_X6, REG_X17, LINK_LIT(LINK_LIT_CYCLES_OLD));
-    host_arm64_LDR_IMM_X(block, REG_X11, REG_X3, 0);
-    host_arm64_LDR_IMM_X(block, REG_X7, REG_X4, 0);
+      does the rest of that arithmetic. X11 = new tsc; the registers that
+      address tsc, tsc_old and cycles_old are kept for the stores*/
+    base_tsc        = link_base(block, REG_X3, &tsc, &off_tsc);
+    base_tsc_old    = link_base(block, REG_X4, &tsc_old, &off_tsc_old);
+    base_cycles_old = link_base(block, REG_X5, &cycles_old, &off_cycles_old);
+    host_arm64_LDR_IMM_X(block, REG_X11, base_tsc, off_tsc);
+    host_arm64_LDR_IMM_X(block, REG_X7, base_tsc_old, off_tsc_old);
     host_arm64_CMPX_REG(block, REG_X11, REG_X7);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
-    host_arm64_LDR_IMM_W(block, REG_W7, REG_X5, 0);
+    host_arm64_LDR_IMM_W(block, REG_W7, base_cycles_old, off_cycles_old);
     host_arm64_SUB_REG(block, REG_W7, REG_W7, REG_W14, 0);
     host_arm64_CMP_IMM(block, REG_W7, 0);
     miss[nr_miss++] = host_arm64_BLE_SHORT_(block);
     host_arm64_ADDX_REG_UXTW(block, REG_X11, REG_X11, REG_W7);
     /*No timer due at the new TSC*/
-    host_arm64_LDR_IMM_X(block, REG_X7, REG_X6, 0);
+    base = link_base(block, REG_X6, &timer_target, &offset);
+    host_arm64_LDR_IMM_X(block, REG_X7, base, offset);
     host_arm64_SUBX_REG(block, REG_X7, REG_X7, REG_X11);
     host_arm64_CMPX_IMM(block, REG_X7, 0);
     miss[nr_miss++] = host_arm64_BLE_SHORT_(block);
@@ -1231,14 +1452,16 @@ build_link_routine(codeblock_t *block)
     host_arm64_CMP_REG(block, REG_W10, REG_W9);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
 
-    /*get_phys(cs + pc) gives phys_page. X6 = &get_phys_virt,
-      X7 = &get_phys_phys, W8 = nonzero if get_phys() would miss its cache*/
-    host_arm64_LDP_IMM_X(block, REG_X6, REG_X7, REG_X17, LINK_LIT(LINK_LIT_GET_PHYS_VIRT));
-    host_arm64_LDR_IMM_W(block, REG_W8, REG_X6, 0);
+    /*get_phys(cs + pc) gives phys_page. The registers that address
+      get_phys_virt and get_phys_phys are kept for the stores; W8 = nonzero
+      if get_phys() would miss its cache*/
+    base_virt = link_base(block, REG_X6, &get_phys_virt, &off_virt);
+    base_phys = link_base(block, REG_X7, &get_phys_phys, &off_phys);
+    host_arm64_LDR_IMM_W(block, REG_W8, base_virt, off_virt);
     host_arm64_EOR_REG(block, REG_W8, REG_W8, REG_W2, 0);
     host_arm64_ANDS_IMM(block, REG_W8, REG_W8, 0xfffff000);
     uncached = host_arm64_BNE_SHORT_(block);
-    host_arm64_LDR_IMM_W(block, REG_W10, REG_X7, 0);
+    host_arm64_LDR_IMM_W(block, REG_W10, base_phys, off_phys);
     host_arm64_CMP_REG(block, REG_W10, REG_W12);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
     xlat_done = &block_write_data[block_pos];
@@ -1268,28 +1491,33 @@ build_link_routine(codeblock_t *block)
 
     /*Every check passed: the C loop's stores, then the next block. W10 =
       CS access | selector << 16*/
-    host_arm64_STR_IMM_Q(block, REG_X11, REG_X3, 0);
-    host_arm64_STR_IMM_Q(block, REG_X11, REG_X4, 0);
-    host_arm64_STR_IMM_W(block, REG_W14, REG_X5, 0);
+    host_arm64_STR_IMM_Q(block, REG_X11, base_tsc, off_tsc);
+    host_arm64_STR_IMM_Q(block, REG_X11, base_tsc_old, off_tsc_old);
+    host_arm64_STR_IMM_W(block, REG_W14, base_cycles_old, off_cycles_old);
     host_arm64_LDR_IMM_W(block, REG_W10, REG_CPUSTATE, rep_state_offset(&cpu_state.seg_cs.access));
-    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X17, LINK_LIT(LINK_LIT_OLDCS));
+    base = link_base(block, REG_X3, &oldcs, &offset);
     host_arm64_UBFX(block, REG_W13, REG_W10, 16, 16);
-    host_arm64_STRH_IMM(block, REG_W13, REG_X3, 0);
+    host_arm64_STRH_IMM(block, REG_W13, base, offset);
+    base = link_base(block, REG_X4, &oldcpl, &offset);
     host_arm64_UBFX(block, REG_W10, REG_W10, 5, 2);
-    host_arm64_STR_IMM_W(block, REG_W10, REG_X4, 0);
+    host_arm64_STR_IMM_W(block, REG_W10, base, offset);
     /*get_phys() only writes its cache when it misses*/
     cached = host_arm64_CBZ_SHORT_(block, REG_W8);
-    host_arm64_STR_IMM_W(block, REG_W2, REG_X6, 0);
-    host_arm64_STR_IMM_W(block, REG_W12, REG_X7, 0);
+    host_arm64_STR_IMM_W(block, REG_W2, base_virt, off_virt);
+    host_arm64_STR_IMM_W(block, REG_W12, base_phys, off_phys);
     host_arm64_short_branch_set_offset(cached, &block_write_data[block_pos]);
     /*cpu_fetch_device and cpu_halted, cleared as the C loop does*/
-    host_arm64_LDP_IMM_X(block, REG_X3, REG_X4, REG_X17, LINK_LIT(LINK_LIT_FETCH_DEVICE));
-    host_arm64_STR_IMM_W(block, REG_WZR, REG_X3, 0);
-    host_arm64_STR_IMM_W(block, REG_WZR, REG_X4, 0);
-    /*The block is about to run: the eviction sweep passes it over once*/
-    host_arm64_LDR_IMM_X(block, REG_X3, REG_X1, LINK_SLOT(block));
-    host_arm64_MOVZ_IMM(block, REG_W4, 1);
-    host_arm64_STRB_IMM(block, REG_W4, REG_X3, offsetof(codeblock_t, used));
+    base = link_base(block, REG_X3, &cpu_fetch_device, &offset);
+    host_arm64_STR_IMM_W(block, REG_WZR, base, offset);
+    base = link_base(block, REG_X4, &cpu_events, &offset);
+    host_arm64_STR_IMM_W(block, REG_WZR, base, offset + offsetof(cpu_events_t, halted));
+    /*The block is about to run: the eviction sweep passes it over once,
+      and a linked entry counts down runs_left as the dispatcher's does.
+      Both are stored only when that changes them: used 1 and runs_left 0
+      stay as they are*/
+    host_arm64_LDRH_IMM(block, REG_W4, REG_X16, offsetof(codeblock_t, used));
+    host_arm64_CMP_IMM(block, REG_W4, 1);
+    used_set = host_arm64_BNE_SHORT_(block);
     host_arm64_BR(block, REG_X15);
 
     /*Miss: the block's own epilogue, X0 still the slots. codegen_exit_rout
@@ -1297,18 +1525,33 @@ build_link_routine(codeblock_t *block)
     miss_dest = &block_write_data[block_pos];
     host_arm64_B(block, codegen_link_miss_rout);
 
-    /*nmi set: miss only if nmi_enable is too, and nmi_mask or an NMI from
-      the local APIC (nmi bit 1, which port 70h does not gate)*/
+    /*Key mismatch: the slot's set (build_link_set_routine), in another
+      allocator block*/
+    host_arm64_short_branch_set_offset(key_miss, &block_write_data[block_pos]);
+    link_set_branch = host_arm64_B_(block);
+
+    /*nmi set: miss if nmi_mask, or bit 1 (an NMI from the local APIC, not
+      gated by port 70h), and nmi_enable too. W12 = nmi*/
     host_arm64_short_branch_set_offset(nmi_set, &block_write_data[block_pos]);
-    host_arm64_LDR_IMM_X(block, REG_X3, REG_X17, LINK_LIT(LINK_LIT_NMI_ENABLE));
-    host_arm64_LDR_IMM_W(block, REG_W3, REG_X3, 0);
+    host_arm64_AND_IMM(block, REG_W3, REG_W12, 2);
+    offset = link_addr(block, REG_X5, &nmi_mask);
+    host_arm64_LDR_IMM_W(block, REG_W5, REG_X5, offset);
+    host_arm64_ORR_REG(block, REG_W3, REG_W3, REG_W5, 0);
     nmi_ok = host_arm64_CBZ_SHORT_(block, REG_W3);
     host_arm64_short_branch_set_offset(nmi_ok, nmi_done);
-    host_arm64_LDR_IMM_X(block, REG_X3, REG_X17, LINK_LIT(LINK_LIT_NMI_MASK));
-    host_arm64_LDR_IMM_W(block, REG_W3, REG_X3, 0);
+    offset = link_addr(block, REG_X3, &nmi_enable);
+    host_arm64_LDR_IMM_W(block, REG_W3, REG_X3, offset);
     miss[nr_miss++] = host_arm64_CBNZ_SHORT_(block, REG_W3);
-    miss[nr_miss++] = host_arm64_TBNZ_SHORT_(block, REG_W12, 1);
     host_arm64_B(block, nmi_done);
+
+    /*used or runs_left to change: X16 = the target block*/
+    host_arm64_short_branch_set_offset(used_set, &block_write_data[block_pos]);
+    host_arm64_MOVZ_IMM(block, REG_W4, 1);
+    host_arm64_STRB_IMM(block, REG_W4, REG_X16, offsetof(codeblock_t, used));
+    host_arm64_LDRB_IMM_W(block, REG_W4, REG_X16, offsetof(codeblock_t, runs_left));
+    host_arm64_MOV_REG_LSR(block, REG_W4, REG_W4, 1);
+    host_arm64_STRB_IMM(block, REG_W4, REG_X16, offsetof(codeblock_t, runs_left));
+    host_arm64_BR(block, REG_X15);
 
     /*get_phys() cache miss: it would store the full address in
       get_phys_virt, and translate through readlookup2[] with paging on or
@@ -1321,8 +1564,8 @@ build_link_routine(codeblock_t *block)
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
     host_arm64_B(block, xlat_done);
     host_arm64_short_branch_set_offset(no_paging, &block_write_data[block_pos]);
-    host_arm64_LDR_IMM_X(block, REG_X10, REG_X17, LINK_LIT(LINK_LIT_RAMMASK));
-    host_arm64_LDR_IMM_W(block, REG_W10, REG_X10, 0);
+    offset = link_addr(block, REG_X10, &rammask);
+    host_arm64_LDR_IMM_W(block, REG_W10, REG_X10, offset);
     host_arm64_LDR_IMM_W(block, REG_W13, REG_X1, LINK_SLOT(rammask));
     host_arm64_CMP_REG(block, REG_W10, REG_W13);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
@@ -1351,26 +1594,29 @@ build_link_routine(codeblock_t *block)
     host_arm64_short_branch_set_offset(byte_mask, &block_write_data[block_pos]);
     host_arm64_LDR_IMM_W(block, REG_W13, REG_X1, LINK_SLOT(cr0_bits));
     no_paging_2 = host_arm64_TBZ_SHORT_(block, REG_W13, 31);
-    host_arm64_LDR_IMM_X(block, REG_X13, REG_X17, LINK_LIT(LINK_LIT_READLOOKUP2));
-    host_arm64_UBFX(block, REG_W16, REG_W10, 12, 20);
-    host_arm64_LDRX_REG_LSL3(block, REG_X13, REG_X13, REG_X16);
+    link_addr_exact(block, REG_X13, readlookup2);
+    host_arm64_UBFX(block, REG_W17, REG_W10, 12, 20);
+    host_arm64_LDRX_REG_LSL3(block, REG_X13, REG_X13, REG_X17);
     host_arm64_CMN_IMM(block, REG_W13, 1);
     miss[nr_miss++] = host_arm64_BEQ_SHORT_(block);
-    host_arm64_LDR_IMM_X(block, REG_X16, REG_X17, LINK_LIT(LINK_LIT_RAM));
-    host_arm64_LDR_IMM_X(block, REG_X16, REG_X16, 0);
+    offset = link_addr(block, REG_X17, &ram);
+    host_arm64_LDR_IMM_X(block, REG_X17, REG_X17, offset);
     host_arm64_ADDX_REG_UXTW(block, REG_X13, REG_X13, REG_W10);
-    host_arm64_SUBX_REG(block, REG_X13, REG_X13, REG_X16);
+    host_arm64_SUBX_REG(block, REG_X13, REG_X13, REG_X17);
     xlat_2_done = &block_write_data[block_pos];
-    host_arm64_LDR_IMM_W(block, REG_W16, REG_X9, offsetof(codeblock_t, phys_2));
-    host_arm64_EOR_REG(block, REG_W16, REG_W16, REG_W13, 0);
-    host_arm64_TST_IMM(block, REG_W16, 0xfffff000);
+    host_arm64_LDR_IMM_W(block, REG_W17, REG_X9, offsetof(codeblock_t, phys_2));
+    host_arm64_EOR_REG(block, REG_W17, REG_W17, REG_W13, 0);
+    host_arm64_TST_IMM(block, REG_W17, 0xfffff000);
     miss[nr_miss++] = host_arm64_BNE_SHORT_(block);
     host_arm64_B(block, two_page_done);
     host_arm64_short_branch_set_offset(no_paging_2, &block_write_data[block_pos]);
-    host_arm64_LDR_IMM_X(block, REG_X16, REG_X17, LINK_LIT(LINK_LIT_RAMMASK));
-    host_arm64_LDR_IMM_W(block, REG_W16, REG_X16, 0);
-    host_arm64_AND_REG(block, REG_W13, REG_W10, REG_W16, 0);
+    offset = link_addr(block, REG_X17, &rammask);
+    host_arm64_LDR_IMM_W(block, REG_W17, REG_X17, offset);
+    host_arm64_AND_REG(block, REG_W13, REG_W10, REG_W17, 0);
     host_arm64_B(block, xlat_2_done);
+
+    if (link_pool_nr)
+        link_pool_emit();
 
     if (nr_miss > LINK_MAX_MISS)
         fatal("build_link_routine - too many miss branches\n");
@@ -1379,7 +1625,158 @@ build_link_routine(codeblock_t *block)
     for (int c = 0; c < nr_miss; c++)
         host_arm64_short_branch_set_offset(miss[c], miss_dest);
 }
+
+_Static_assert(offsetof(codegen_link_slot_t, set) == 86 && offsetof(codegen_link_slot_t, page_mask) == 88
+                   && sizeof(codegen_link_slot_t) == 104 && sizeof(codegen_link_set_t) == 320,
+               "the set lookup copies a slot as the words below, and finds a set as 320 * its number");
+#        define LINK_SET_E(n) ((int) offsetof(codegen_link_set_t, e[n]))
+
+/*Entered from the link routine when the slot's key does not match, with X0 =
+  X1 = the slot, W2 = cs + pc and X4 = pc | cs << 32. If an entry of the
+  slot's set holds that key, it becomes the set's most recently used, its
+  record and the slot's trade places, and the routine goes on with its
+  checks on the slot as if the slot had matched. Otherwise, the block's own
+  epilogue, as for any miss.
+
+  The new slot record is stored in pairs where the routine loads pairs, so
+  each of the routine's loads reads from one store.*/
+static void
+build_link_set_routine(codeblock_t *block)
+{
+    static const void *const set_globals[] = { codegen_link_sets, codegen_link_set_mtf };
+    uint8_t                 *start_data;
+    uint32_t                *no_set;
+    uint32_t                *no_entry;
+    uint8_t                 *miss_dest;
+    uint8_t                 *rout;
+
+    codegen_alloc(block, BLOCK_MAX - 4);
+    start_data = block_write_data;
+
+    link_adrp = 1;
+    for (size_t c = 0; c < sizeof(set_globals) / sizeof(set_globals[0]); c++) {
+        if (!host_arm64_ADRP_in_range((uintptr_t) set_globals[c] - 0x1000)
+            || !host_arm64_ADRP_in_range((uintptr_t) set_globals[c] + 0x1000))
+            link_adrp = 0;
+    }
+    link_pool_nr = 0;
+
+    rout = &block_write_data[block_pos];
+
+    /*X5 = the set*/
+    host_arm64_LDRH_IMM(block, REG_W3, REG_X0, LINK_SLOT(set));
+    no_set = host_arm64_CBZ_SHORT_(block, REG_W3);
+    link_addr_exact(block, REG_X5, codegen_link_sets);
+    host_arm64_ADD_REG(block, REG_W3, REG_W3, REG_W3, 2);
+    host_arm64_MOV_REG(block, REG_W3, REG_W3, 6);
+    host_arm64_ADDX_REG_UXTW(block, REG_X5, REG_X5, REG_W3);
+
+    /*X10 = the entry with the key, or 0; W11 = its number*/
+    host_arm64_LDR_IMM_X(block, REG_X6, REG_X5, LINK_SET_E(0) + LINK_SLOT(exit_pc));
+    host_arm64_LDR_IMM_X(block, REG_X7, REG_X5, LINK_SET_E(1) + LINK_SLOT(exit_pc));
+    host_arm64_LDR_IMM_X(block, REG_X8, REG_X5, LINK_SET_E(2) + LINK_SLOT(exit_pc));
+    host_arm64_ADDX_IMM(block, REG_X12, REG_X5, LINK_SET_E(0));
+    host_arm64_ADDX_IMM(block, REG_X13, REG_X5, LINK_SET_E(1));
+    host_arm64_ADDX_IMM(block, REG_X14, REG_X5, LINK_SET_E(2));
+    host_arm64_MOVZ_IMM(block, REG_W16, 1);
+    host_arm64_MOVZ_IMM(block, REG_W17, 2);
+    host_arm64_CMPX_REG(block, REG_X6, REG_X4);
+    host_arm64_CSELX_EQ(block, REG_X10, REG_X12, REG_XZR);
+    host_arm64_CMPX_REG(block, REG_X7, REG_X4);
+    host_arm64_CSELX_EQ(block, REG_X10, REG_X13, REG_X10);
+    host_arm64_CSEL_EQ(block, REG_W11, REG_W16, REG_WZR);
+    host_arm64_CMPX_REG(block, REG_X8, REG_X4);
+    host_arm64_CSELX_EQ(block, REG_X10, REG_X14, REG_X10);
+    host_arm64_CSEL_EQ(block, REG_W11, REG_W17, REG_W11);
+    no_entry = host_arm64_CBZ_SHORT_(block, REG_X10);
+
+    /*order = codegen_link_set_mtf[order][W11]*/
+    host_arm64_LDRB_IMM_W(block, REG_W3, REG_X5, offsetof(codegen_link_set_t, order));
+    link_addr_exact(block, REG_X6, codegen_link_set_mtf);
+    host_arm64_ADD_REG(block, REG_W3, REG_W11, REG_W3, 2);
+    host_arm64_LDRB_REG(block, REG_W3, REG_X6, REG_X3);
+    host_arm64_STRB_IMM(block, REG_W3, REG_X5, offsetof(codegen_link_set_t, order));
+
+    /*The two records trade places, bytes 0-47 first. X15 = the slot's new
+      entry*/
+    host_arm64_LDP_IMM_X(block, REG_X3, REG_X5, REG_X10, 0);
+    host_arm64_LDP_IMM_X(block, REG_X6, REG_X7, REG_X10, 16);
+    host_arm64_LDP_IMM_X(block, REG_X8, REG_X9, REG_X10, 32);
+    host_arm64_LDP_IMM_X(block, REG_X11, REG_X12, REG_X0, 0);
+    host_arm64_LDP_IMM_X(block, REG_X13, REG_X14, REG_X0, 16);
+    host_arm64_LDP_IMM_X(block, REG_X16, REG_X17, REG_X0, 32);
+    host_arm64_STP_IMM_X(block, REG_X3, REG_X5, REG_X0, 0);
+    host_arm64_STP_IMM_X(block, REG_X6, REG_X7, REG_X0, 16);
+    host_arm64_STP_IMM_X(block, REG_X8, REG_X9, REG_X0, 32);
+    host_arm64_STP_IMM_X(block, REG_X11, REG_X12, REG_X10, 0);
+    host_arm64_STP_IMM_X(block, REG_X13, REG_X14, REG_X10, 16);
+    host_arm64_STP_IMM_X(block, REG_X16, REG_X17, REG_X10, 32);
+    host_arm64_MOVX_REG(block, REG_X15, REG_X5, 0);
+    host_arm64_LDP_IMM_X(block, REG_X3, REG_X5, REG_X10, 48);
+    host_arm64_LDP_IMM_X(block, REG_X6, REG_X7, REG_X10, 64);
+    host_arm64_LDR_IMM_X(block, REG_X8, REG_X10, 80);
+    host_arm64_LDP_IMM_X(block, REG_X9, REG_X11, REG_X10, 88);
+    host_arm64_LDP_IMM_X(block, REG_X12, REG_X13, REG_X0, 48);
+    host_arm64_LDP_IMM_X(block, REG_X14, REG_X16, REG_X0, 64);
+    host_arm64_LDR_IMM_X(block, REG_X17, REG_X0, 80);
+    host_arm64_LDP_IMM_X(block, REG_X1, REG_X4, REG_X0, 88);
+    host_arm64_STP_IMM_X(block, REG_X3, REG_X5, REG_X0, 48);
+    host_arm64_STP_IMM_X(block, REG_X6, REG_X7, REG_X0, 64);
+    host_arm64_STR_IMM_Q(block, REG_X8, REG_X0, 80);
+    host_arm64_STP_IMM_X(block, REG_X9, REG_X11, REG_X0, 88);
+    host_arm64_STP_IMM_X(block, REG_X12, REG_X13, REG_X10, 48);
+    host_arm64_STP_IMM_X(block, REG_X14, REG_X16, REG_X10, 64);
+    host_arm64_STR_IMM_Q(block, REG_X17, REG_X10, 80);
+    host_arm64_STP_IMM_X(block, REG_X1, REG_X4, REG_X10, 88);
+    host_arm64_MOVX_REG(block, REG_X1, REG_X0, 0);
+    host_arm64_B(block, link_set_return);
+
+    miss_dest = &block_write_data[block_pos];
+    host_arm64_B(block, codegen_link_miss_rout);
+
+    if (link_pool_nr)
+        link_pool_emit();
+
+    if (block_write_data != start_data)
+        fatal("build_link_set_routine - routine does not fit in one allocator block\n");
+    host_arm64_short_branch_set_offset(no_set, miss_dest);
+    host_arm64_short_branch_set_offset(no_entry, miss_dest);
+    host_arm64_branch_set_offset(link_set_branch, rout);
+}
 #    endif
+
+static void
+build_exit_charged(codeblock_t *block, void **entries, int nr, void *route)
+{
+    const int offset = (uintptr_t) &cpu_state._cycles - (uintptr_t) &cpu_state;
+
+    for (int c = 1; c <= nr; c++) {
+        codegen_alloc(block, 16);
+        entries[c - 1] = &block_write_data[block_pos];
+        host_arm64_LDR_IMM_W(block, REG_TEMP, REG_CPUSTATE, offset);
+        host_arm64_SUB_IMM(block, REG_TEMP, REG_TEMP, c);
+        host_arm64_STR_IMM_W(block, REG_TEMP, REG_CPUSTATE, offset);
+        host_arm64_B(block, route);
+    }
+}
+
+void *
+codegen_exit_dest(void *route, int add)
+{
+    const int charge = -add;
+
+    if (!add)
+        return route;
+    if (charge < 1)
+        return NULL;
+    if ((route == codegen_exit_rout) && (charge <= EXIT_CHARGED_EXIT))
+        return codegen_exit_charged[charge - 1];
+    if ((route == codegen_gpf_rout) && (charge <= EXIT_CHARGED_GPF))
+        return codegen_gpf_charged[charge - 1];
+    if ((route == codegen_ss_rout) && (charge <= EXIT_CHARGED_SS))
+        return codegen_ss_charged[charge - 1];
+    return NULL;
+}
 
 void
 codegen_backend_init(void)
@@ -1441,17 +1838,22 @@ codegen_backend_init(void)
     host_arm64_call(block, (void *) x86ss);
     host_arm64_B(block, codegen_exit_rout);
 
+    build_exit_charged(block, codegen_exit_charged, EXIT_CHARGED_EXIT, codegen_exit_rout);
+    build_exit_charged(block, codegen_gpf_charged, EXIT_CHARGED_GPF, codegen_gpf_rout);
+    build_exit_charged(block, codegen_ss_charged, EXIT_CHARGED_SS, codegen_ss_rout);
+
     for (int is_stos = 0; is_stos < 2; is_stos++) {
         for (int shift = 0; shift < 3; shift++) {
             for (int a32 = 0; a32 < 2; a32++) {
                 codegen_rep_rout[is_stos][shift][a32] = &block_write_data[block_pos];
-                build_rep_routine(block, is_stos, shift, a32, codegen_rep_elem[is_stos][shift][a32]);
+                build_rep_routine(block, is_stos, shift, a32, codegen_rep_run[is_stos][shift][a32]);
             }
         }
     }
 
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
     build_link_routine(block);
+    build_link_set_routine(block);
 #    endif
 
     block_write_data = NULL;
@@ -1459,9 +1861,21 @@ codegen_backend_init(void)
     codegen_allocator_clean_blocks(block->head_mem_block);
 
     {
-        const void *veneer_targets[] = { codegen_exit_rout, codegen_gpf_rout, codegen_ss_rout };
+        const void *veneer_targets[3 + EXIT_CHARGED_EXIT + EXIT_CHARGED_GPF + EXIT_CHARGED_SS];
+        int         nr = 0;
 
-        codegen_allocator_set_veneers(veneer_targets, sizeof(veneer_targets) / sizeof(veneer_targets[0]));
+        _Static_assert((sizeof(veneer_targets) / sizeof(veneer_targets[0])) <= (MEM_BLOCK_SIZE / 4),
+                       "more veneer targets than a veneer block holds");
+        veneer_targets[nr++] = codegen_exit_rout;
+        veneer_targets[nr++] = codegen_gpf_rout;
+        veneer_targets[nr++] = codegen_ss_rout;
+        for (int c = 0; c < EXIT_CHARGED_EXIT; c++)
+            veneer_targets[nr++] = codegen_exit_charged[c];
+        for (int c = 0; c < EXIT_CHARGED_GPF; c++)
+            veneer_targets[nr++] = codegen_gpf_charged[c];
+        for (int c = 0; c < EXIT_CHARGED_SS; c++)
+            veneer_targets[nr++] = codegen_ss_charged[c];
+        codegen_allocator_set_veneers(veneer_targets, nr);
     }
 
     asm("mrs %0, fpcr\n"
@@ -1527,6 +1941,7 @@ codegen_backend_epilogue(codeblock_t *block)
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
     if (codegen_block_link) {
         codegen_link_exit(block);
+        codegen_lazy_stubs_emit(block);
         codegen_allocator_clean_blocks(block->head_mem_block);
         return;
     }
@@ -1539,6 +1954,7 @@ codegen_backend_epilogue(codeblock_t *block)
     host_arm64_LDP_POSTIDX_X(block, REG_X29, REG_X30, REG_XSP, 16);
     host_arm64_RET(block, REG_X30);
 
+    codegen_lazy_stubs_emit(block);
     codegen_allocator_clean_blocks(block->head_mem_block);
 }
 

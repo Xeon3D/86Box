@@ -114,7 +114,9 @@ enum {
     CPU_PKG_SOCKET8          = (1 << 24),
     CPU_PKG_SLOT1            = (1 << 25),
     CPU_PKG_SLOT2            = (1 << 26),
-    CPU_PKG_SOCKET370        = (1 << 27)
+    CPU_PKG_SOCKET370        = (1 << 27),
+    CPU_PKG_GXM              = (1 << 29),
+    CPU_PKG_386EX            = (1 << 30)
 };
 
 #define CPU_SUPPORTS_DYNAREC 1
@@ -128,6 +130,9 @@ enum {
 
 #define CCR3_SMI_LOCK (1 << 0)
 #define CCR3_NMI_EN   (1 << 1)
+#define CCR3_MAPEN    (1 << 4) /* MediaGX: MAPEN is the one bit, 7:5 are LSS_x */
+
+#define CCR4_SMI_NEST (1 << 6) /* MediaGX */
 
 #if (defined __amd64__ || defined _M_X64)
 #    define LOOKUP_INV -1LL
@@ -445,6 +450,15 @@ typedef struct {
        permanent register of the recompiler, for the division helper
        (x87_dyn_fdiv, 386_dynarec.c) */
     double x87_operand;
+
+    /* The second page's walk a hand-over's op makes where its fetch_ea
+       would read the displacement (386_dynarec_ops.c), 0 for none: stored
+       by the compiled code before the call, which reaches no global
+       outside cpu_state. The page's first byte, with bit 0 set and bit 1
+       for an x87 op whose data pointer was recorded (codegen_skip); the
+       part is what the displacement's bytes on that page add to eaaddr */
+    uint32_t handover_walk;
+    uint32_t handover_walk_part;
 #endif
 } cpu_state_t;
 
@@ -458,6 +472,9 @@ typedef struct {
 #define CPU_STATUS_USE32   (1 << 0)
 #define CPU_STATUS_STACK32 (1 << 1)
 #define CPU_STATUS_PMODE   (1 << 2)
+/* EFLAGS.VM, whatever CR0.PE is (a real-mode IRETD, RSM or LOADALL can
+   set VM with PE clear, and the interpreter's ops that test VM alone then
+   act on it); V86 mode is PMODE and V86 together */
 #define CPU_STATUS_V86     (1 << 3)
 #define CPU_STATUS_SMM     (1 << 4)
 /* x87 precision control = 24-bit: the double-based FPU must round
@@ -475,6 +492,18 @@ typedef struct {
 #define CPU_STATUS_NOTFLATDS (1 << 8)
 #define CPU_STATUS_NOTFLATSS (1 << 9)
 #define CPU_STATUS_NOTFLATES (1 << 10)
+/* DS (SS) not "wide": wide is a limit_high of 0xffffffff, which an
+   expand-down segment with B set has (Win9x's Win32 DS and SS), and for DS
+   a writable data segment that is not null as well. The compiled limit check of a wide
+   segment needs only its low bound, and a wide DS needs no null or
+   writable check (CHECK_SEG_LIMITS, codegen_check_seg_read/write). */
+#define CPU_STATUS_NOTWIDEDS (1 << 11)
+#define CPU_STATUS_NOTWIDESS (1 << 12)
+/* Some segment register (CS, DS, ES, SS, FS or GS) has limits other than
+   0..0xffff. Clear, a V86 block leaves out the limit checks of accesses
+   that can't pass 0xffff (CHECK_SEG_LIMITS). Every write of other limits
+   sets it (cpu_mark_64k_status); only cpu_update_64k_status clears it. */
+#define CPU_STATUS_NOT64K    (1 << 13)
 #define CPU_STATUS_MASK      0xff00
 
 
@@ -554,6 +583,7 @@ extern int is186;
 extern int is286;
 extern int is386;
 extern int is6117;
+extern int is386ex;
 extern int is486;
 extern int is586;
 extern int is_am486;
@@ -586,13 +616,73 @@ extern uint32_t cpu_features;
 extern int smi_latched;
 extern int smm_in_hlt;
 extern int smi_block;
-/* The processor stopped in HLT, its PC on the HLT (opHLT): an interrupt
-   taken from there returns past it. */
-extern int cpu_halted;
+/* cpu_halted, cpu_init, new_ne, x86_was_reset, cpu_flush_pending,
+   cpu_force_interpreter, cpu_override_dynarec and cpu_dr_armed: the flags
+   the loop tests between two blocks, kept together in cpu_events */
+#include <86box/cpu_events.h>
+
+/* The chipset's ACPI clock control (acpi.c).  cpu_stpclk: STPCLK#
+   held by a P_LVL2/P_LVL3 read (C2/C3), no instruction runs until a break
+   event (an interrupt request, NMI or SMI).  cpu_throttle_run: STPCLK#
+   modulated (THT_EN), the processor running cpu_throttle_run parts of every
+   cpu_throttle_period, 0 = not throttled; cpu_throttle_break: a break event
+   ends the throttling (the PIIX4 before the PIIX4E).  cpu_stpclk and
+   cpu_throttle_run live in cpu_events. */
+extern int cpu_throttle_period;
+extern int cpu_throttle_break;
 extern int cpu_is_p5(void);
 extern int cpu_init_keeps_state(void);
+extern int cpu_soft_reset_keeps_fpu(void);
 
 extern uint16_t cpu_cur_status;
+
+/* The NOTWIDEDS/NOTWIDESS bit of a segment just loaded, set wherever its
+   NOTFLAT bit is */
+static inline void
+cpu_set_wide_status(const x86seg *s)
+{
+    if (s == &cpu_state.seg_ds) {
+        /*A base of 0xffffffff is the null selector's mark, faulted on
+          every access (SEG_CHECK_READ/WRITE) whatever the descriptor*/
+        if ((s->limit_high == 0xffffffff) && ((s->access & 0x0a) == 0x02) && (s->base != 0xffffffff))
+            cpu_cur_status &= ~CPU_STATUS_NOTWIDEDS;
+        else
+            cpu_cur_status |= CPU_STATUS_NOTWIDEDS;
+    } else if (s == &cpu_state.seg_ss) {
+        if (s->limit_high == 0xffffffff)
+            cpu_cur_status &= ~CPU_STATUS_NOTWIDESS;
+        else
+            cpu_cur_status |= CPU_STATUS_NOTWIDESS;
+    }
+}
+
+/* A segment's limits were just written: other than 0..0xffff, NOT64K is
+   set. Any descriptor may be passed; one that is not a segment register
+   only sets the bit when it needn't */
+static inline void
+cpu_mark_64k_status(const x86seg *s)
+{
+    if (s->limit_low || (s->limit_high != 0xffff))
+        cpu_cur_status |= CPU_STATUS_NOT64K;
+}
+
+/* NOT64K from the six segment registers themselves */
+static inline void
+cpu_update_64k_status(void)
+{
+    if (cpu_state.seg_cs.limit_low || (cpu_state.seg_cs.limit_high != 0xffff) || cpu_state.seg_ds.limit_low || (cpu_state.seg_ds.limit_high != 0xffff) || cpu_state.seg_es.limit_low || (cpu_state.seg_es.limit_high != 0xffff) || cpu_state.seg_ss.limit_low || (cpu_state.seg_ss.limit_high != 0xffff) || cpu_state.seg_fs.limit_low || (cpu_state.seg_fs.limit_high != 0xffff) || cpu_state.seg_gs.limit_low || (cpu_state.seg_gs.limit_high != 0xffff))
+        cpu_cur_status |= CPU_STATUS_NOT64K;
+    else
+        cpu_cur_status &= ~CPU_STATUS_NOT64K;
+}
+
+/* The V86 status bit from EFLAGS.VM, after a write of VM */
+static inline void
+cpu_set_v86_status(void)
+{
+    cpu_cur_status = (cpu_cur_status & ~CPU_STATUS_V86) | ((cpu_state.eflags & VM_FLAG) ? CPU_STATUS_V86 : 0);
+}
+
 extern uint64_t cpu_CR4_mask;
 extern uint64_t cpu_CR4_ignore;
 extern uint64_t tsc;
@@ -639,9 +729,7 @@ extern uint32_t _tr[8];
    effect on a hard reset. */
 extern int cpu_debug_regs_486;
 /* cpu_debug_regs_486 and an enabled breakpoint in DR7: the per-access checks
-   are made only while this is set. Kept by cpu_dr7_update(), which must
-   follow every write to DR7. */
-extern int cpu_dr_armed;
+   are made only while cpu_dr_armed (cpu_events) is set. */
 extern void cpu_dr7_update(void);
 
 /* For the Cyrix 6x86(MX) */
@@ -687,10 +775,12 @@ extern int cpu_prefetch_cycles;
 extern int cpu_prefetch_width;
 extern int cpu_mem_prefetch_cycles;
 extern int cpu_rom_prefetch_cycles;
+/* The machine has an MCA bus: set by cpu_set(), which every machine change
+   reaches before an instruction runs. */
+extern int cpu_mca_bus;
 extern int cpu_waitstates;
 extern int io_waitstates;
 extern int reg_op_waitstates;
-extern int cpu_flush_pending;
 extern int cpu_old_paging;
 extern int cpu_cache_int_enabled;
 extern int cpu_cache_ext_enabled;
@@ -800,9 +890,11 @@ extern void refreshread(void);
 extern void refreshread_vx0(void);
 extern void resetreadlookup(void);
 extern void softresetx86(void);
+extern void softresetx86_from(int src);
 extern void x86_reset_deferred(void);
 extern void hardresetx86(void);
 extern void x86_int(int num);
+extern int  x86_int_external;
 extern void x86_int_sw(int num);
 extern int  x86_int_sw_rm(int num);
 
@@ -825,6 +917,7 @@ extern void cpu_car_reset(void);
 extern void cpu_car_enable(void);
 
 extern void update_tsc(void);
+extern void update_tsc_write(uint64_t new_tsc);
 
 extern int sysenter(uint32_t fetchdat);
 extern int sysexit(uint32_t fetchdat);
@@ -859,6 +952,11 @@ typedef struct {
 } cyrix_t;
 
 #define x87_op cpu_state.x87_op
+/* Or'd into x87_op by an x87 instruction left unexecuted (#NM, a pending
+   exception reported at it, an undefined escape's #UD): its escape wrapper
+   then leaves the FPU pointers as they were. Every escape stores x87_op
+   afresh, and its readers take the low 11 bits. */
+#define X87_OP_NOT_EXECUTED 0x80000000
 
 extern uint32_t addr64;
 extern uint32_t addr64_2;
@@ -867,10 +965,75 @@ extern uint32_t addr64a_2[8];
 
 extern int soft_reset_pci;
 
+/* The sources of a soft reset, for a board whose reset logic also resets
+   the 387 on them (soft_reset_387, set by its chipset) */
+#define SOFT_RESET_KBC      0x01 /* the 8042's reset pulse */
+#define SOFT_RESET_SHUTDOWN 0x02 /* a shutdown (triple fault) */
+#define SOFT_RESET_PORT92   0x04 /* port 92h's fast reset */
+extern int soft_reset_387;
+
 extern int reset_on_hlt;
 extern int hlt_reset_pending;
 
 extern cyrix_t cyrix;
+
+/* The MediaGX's processor core extensions: the GCR, VGACTL and VGAM
+   configuration registers, the scratchpad RAM carved out of the L1 cache with
+   its BLT buffer registers, and the internal SMIs (MediaGX MMX data book,
+   3.3.2.2, 3.11, 4.1 and 5.2.3). */
+#define GCR_GX_BASE        0x03
+#define GCR_SP_SIZE        0x0c
+
+#define GXM_SMI_NONE       0
+#define GXM_SMI_IO         1 /* VGA I/O, trapped by the internal bus interface unit */
+#define GXM_SMI_MEM        2 /* VGA memory write, trapped in instruction decode */
+
+typedef struct gxm_t {
+    uint8_t  gcr;
+    uint8_t  vgactl;
+    uint8_t  pcr;
+    uint32_t vgam;
+
+    uint32_t bb_base[2]; /* L1_BBx_BASE */
+    uint32_t bb_ptr[2];  /* L1_BBx_POINTER */
+    uint32_t pm_base;
+    uint32_t pm_mask;
+
+    uint8_t  nested;     /* Nested SMI Status */
+    uint8_t  smi_int;    /* A pending internal SMI: GXM_SMI_* */
+    uint8_t  smi_ext;    /* A pending SMI# */
+    uint8_t  smi_write;
+    uint8_t  smi_size;
+    uint16_t smi_port;
+    uint32_t smi_addr;
+    uint32_t smi_data;
+
+    uint8_t  scratchpad[4096];
+
+    /* MSRs 70000001h-70000003h: the CPUID vendor string, four bytes each. */
+    uint32_t vendor_msr[3];
+
+    /* The integrated functions: the GCR moves them, CPU_READ/CPU_WRITE
+       reach the power management address decode. */
+    void   (*gcr_write)(void *priv);
+    /* RESET also resets them: they are part of the processor. */
+    void   (*reset)(void *priv);
+    void    *priv;
+    /* SMI#, as a level: an RSM with it still asserted is the next SMI
+       (3.11.3). */
+    int    (*smi_pin)(void);
+    /* PSERIAL: the serial packet, as the CS5530 receives it (6.6). */
+    void   (*serial_packet)(uint8_t packet);
+} gxm_t;
+
+extern gxm_t gxm;
+extern int   is_gxm;
+
+extern void cpu_gxm_reset(void);
+extern void cpu_gxm_smi_io(uint16_t port, int size, int write, uint32_t val);
+extern void cpu_gxm_smi_mem(uint32_t addr, int size, uint32_t val);
+extern void cpu_gxm_smi_pin_check(int was_enabled);
+extern int  cyrix_smi_enabled(void);
 
 extern int prefetch_prefixes;
 extern int cpu_use_exec;
@@ -890,9 +1053,15 @@ extern uint8_t do_translate2;
 extern void SF_FPU_reset(void);
 
 extern void reset_808x(int hard);
+extern uint16_t ip_808x(void);
+extern void     flush_prefetch_808x(void);
+extern int      queue_peek_808x(uint8_t *buf, int max);
+extern int      fpu_8087_op_illegal(uint8_t op, uint8_t modrm);
+extern void     set_ip_808x(uint16_t new_ip);
 extern void interrupt_808x(uint16_t addr);
 
 extern void reset_vx0(int hard);
+extern int  vx0_i8080_state(uint16_t *pc, uint16_t *sp, uint8_t *r, uint8_t *flags);
 
 /*
  * CPU-owned LAPIC API: LAPIC/IOAPIC code routes through these helpers instead
@@ -1069,9 +1238,6 @@ extern uint16_t *MMEP[8];
 
 extern int  cpu_block_end;
 
-extern int  cpu_force_interpreter;
-extern int  cpu_override_dynarec;
-
 extern int  inrecomp;
 
 extern void mmx_init(void);
@@ -1087,7 +1253,6 @@ extern int lock_legal_80[8];
 extern int lock_legal_f6[8];
 extern int lock_legal_fe[8];
 
-extern int new_ne;
 extern int fpu_ignne;
 
 /* When an unmasked x87 exception asserts FERR# with CR0.NE clear */

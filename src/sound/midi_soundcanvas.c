@@ -512,6 +512,10 @@ soundcanvas_close(void *priv)
     data->on = 0;
     thread_set_event(data->event);
     thread_wait(data->thread_h);
+    thread_destroy_event(data->event);
+    thread_destroy_event(data->start_event);
+    data->event       = NULL;
+    data->start_event = NULL;
 
     /* Destroy CLAP instance */
     if (data->clap_inst) {
