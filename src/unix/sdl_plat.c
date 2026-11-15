@@ -374,12 +374,16 @@ plat_get_exe_name(char *s, int size)
     snprintf(s, size, "%s%s", basepath, basepath[strlen(basepath) - 1] == '/' ? EMU_NAME : "/" EMU_NAME);
 }
 
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_get_global_config_dir(char *outbuf, const size_t len)
 {
     return plat_get_global_data_dir(outbuf, len);
 }
+#endif
 
+
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_get_vmm_dir(char *outbuf, const size_t len)
 {
@@ -387,6 +391,8 @@ plat_get_vmm_dir(char *outbuf, const size_t len)
     if (len > 0)
         outbuf[0] = 0;
 }
+#endif
+
 
 /*
  * Timer functions
@@ -498,11 +504,13 @@ ui_notify(int what)
     }
 }
 
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 char *
 plat_vidapi_name(UNUSED(int i))
 {
     return "default";
 }
+#endif
 
 void
 plat_get_cpu_string(char *outbuf, uint8_t len)

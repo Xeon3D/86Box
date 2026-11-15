@@ -79,6 +79,7 @@ plat_tempfile(char *bufp, char *prefix, char *suffix)
 }
 #undef TMPFILE_BUFSIZE
 
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_get_global_data_dir(char *outbuf, const size_t len)
 {
@@ -101,7 +102,10 @@ plat_get_global_data_dir(char *outbuf, const size_t len)
     outbuf[len - 1] = '\0';
     path_slash(outbuf);
 }
+#endif
 
+
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_get_temp_dir(char *outbuf, uint8_t len)
 {
@@ -112,9 +116,12 @@ plat_get_temp_dir(char *outbuf, uint8_t len)
     strncpy(outbuf, tmpdir, len);
     path_slash(outbuf);
 }
+#endif
+
 
 #define TMP_PATH_BUFSIZE 1024
 
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_init_rom_paths(void)
 {
@@ -190,7 +197,10 @@ plat_init_rom_paths(void)
     rom_add_path(default_rom_path);
 #endif
 }
+#endif
 
+
+#ifndef HAIKU_NATIVE_PATHS /* the native Haiku UI has its own (src/haiku) */
 void
 plat_init_asset_paths(void)
 {
@@ -266,6 +276,8 @@ plat_init_asset_paths(void)
     asset_add_path(default_asset_path);
 #endif
 }
+#endif
+
 #undef TMP_PATH_BUFSIZE
 
 /*

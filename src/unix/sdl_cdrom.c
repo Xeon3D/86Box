@@ -123,6 +123,8 @@ floppy_eject(uint8_t id)
     config_save();
 }
 
+#ifndef HAIKU_NATIVE_MEDIA
+/* The native Haiku UI has its own, which also records the image history. */
 void
 plat_cdrom_ui_update(uint8_t id, UNUSED(uint8_t reload))
 {
@@ -136,6 +138,7 @@ plat_cdrom_ui_update(uint8_t id, UNUSED(uint8_t reload))
 
     ui_sb_update_tip(SB_CDROM | id);
 }
+#endif
 
 void
 cdrom_mount(uint8_t id, char *fn)

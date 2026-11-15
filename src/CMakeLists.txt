@@ -373,7 +373,11 @@ endif()
 
 add_subdirectory(osd)
 
-if (QT)
+if (HAIKU_NATIVE)
+    # Unlike the SDL UI, the native Haiku UI has the VM manager and the
+    # settings-only mode, so it does not define USE_SDL_UI.
+    add_subdirectory(haiku)
+elseif (QT)
     add_subdirectory(qt)
 else()
     add_compile_definitions(USE_SDL_UI)
