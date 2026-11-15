@@ -290,9 +290,9 @@ public:
         tp_list->SetSelectionMessage(new BMessage(MSG_TAPE_ROW));
 
         BTabView *tabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-        tabs->AddTab(MakeTab("MO drives", "mo_scroll", mo_list, mo_bus, mo_channel, mo_type));
-        tabs->AddTab(MakeTab("Removable disk drives", "rdisk_scroll", rd_list, rd_bus, rd_channel, rd_type));
-        tabs->AddTab(MakeTab("Tape drives", "tape_scroll", tp_list, tp_bus, tp_channel, tp_type));
+        AddIconTab(tabs, MakeTab("MO drives", "mo_scroll", mo_list, mo_bus, mo_channel, mo_type), "mo");
+        AddIconTab(tabs, MakeTab("Removable disk drives", "rdisk_scroll", rd_list, rd_bus, rd_channel, rd_type), "rdisk_tab");
+        AddIconTab(tabs, MakeTab("Tape drives", "tape_scroll", tp_list, tp_bus, tp_channel, tp_type), "tape");
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
             .Add(tabs);
@@ -502,6 +502,11 @@ private:
     /* qt_settingsotherremovable.ui: the list (Bus | Type), then a grid:
          Bus: [bus]  Channel: [channel]
          Type: [type..................]   */
+    static void AddIconTab(BTabView *tabs, BView *view, const char *icon)
+    {
+        tabs->AddTab(view, settings_icon_tab(view, haiku_icon(icon)));
+    }
+
     static BView *MakeTab(const char *name, const char *scroll_name, BListView *list, Choice *bus, Choice *channel, Choice *type)
     {
         BView *tab = new BView(name, 0);

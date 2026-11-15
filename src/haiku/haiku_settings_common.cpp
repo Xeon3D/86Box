@@ -366,13 +366,13 @@ SettingsIconItem::Update(BView *owner, const BFont *font)
 }
 
 BTab *
-settings_icon_tab(BView *view, BBitmap *icon)
+settings_icon_tab(BView *view, BBitmap *icon, const char *name)
 {
     /* Spaces before the name make the tab wide enough for the icon. */
     std::string label;
     while (be_plain_font->StringWidth(label.c_str()) < kIcon + 4)
         label += ' ';
-    label += view->Name();
+    label += (name != nullptr) ? name : view->Name();
 
     IconTab *tab = new IconTab(view, icon);
     tab->SetLabel(label.c_str());

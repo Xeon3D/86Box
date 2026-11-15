@@ -66,7 +66,10 @@ set(HAIKU_ICONS
     # Settings: page list, tabs and drive lists
     machine display input_devices ports storage_controllers
     floppy_and_cdrom_drives other_removable_devices other_peripherals
-    floppy_tab
+    floppy_tab machine_tab processor performance general_display monitor
+    general_sound midi parallel_ports serial_ports
+    general_storage_controllers scsi_controllers general_other_peripherals
+    isa_memory isa_rom rdisk_tab
     # VM manager
     86Box-gray new_vm
 )
@@ -167,3 +170,4 @@ target_link_libraries(plat PRIVATE SDL3::Headers)
 # libgame is passed as -lgame because 86Box has its own target named "game"
 # (src/game, the gameport code), which a plain "game" would resolve to.
 target_link_libraries(86Box SDL3::SDL3 be tracker translation GL -lgame ${CMAKE_DL_LIBS})
+

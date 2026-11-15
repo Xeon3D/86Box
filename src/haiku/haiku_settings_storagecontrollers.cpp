@@ -26,6 +26,7 @@
 #include <string>
 
 #include "haiku_deviceconfig.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 #include "haiku_settings_storage.hpp"
 
@@ -134,8 +135,8 @@ public:
         scsi_view->GridLayout()->SetColumnWeight(1, 1.0f);
 
         BTabView *tabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-        tabs->AddTab(general);
-        tabs->AddTab(scsi_view);
+        tabs->AddTab(general, settings_icon_tab(general, haiku_icon("general_storage_controllers")));
+        tabs->AddTab(scsi_view, settings_icon_tab(scsi_view, haiku_icon("scsi_controllers")));
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)

@@ -27,6 +27,7 @@
 
 #include "haiku_deviceconfig.hpp"
 #include "haiku_settings.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -145,7 +146,7 @@ public:
                 .Add(grid)
                 .AddGlue();
         }
-        AddTab(tabs, parallel, "Parallel ports");
+        AddTab(tabs, parallel, "Parallel ports", "parallel_ports");
 
         /* Serial ports */
         BGroupView *serial = new BGroupView(B_VERTICAL);
@@ -171,7 +172,7 @@ public:
                 .Add(grid)
                 .AddGlue();
         }
-        AddTab(tabs, serial, "Serial ports");
+        AddTab(tabs, serial, "Serial ports", "serial_ports");
 
         /* USB */
         msd_drives = new BTextView("msd_drives");
@@ -208,7 +209,7 @@ public:
                 .AddGlue()
             .End()
             .AddGlue();
-        AddTab(tabs, usb, "USB");
+        AddTab(tabs, usb, "USB", "ports");
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .Add(tabs)
@@ -393,11 +394,10 @@ private:
         bool       changed; /* its configuration was changed */
     };
 
-    static void AddTab(BTabView *tabs, BView *view, const char *label)
+    /* A tab with Qt's icon for it. */
+    static void AddTab(BTabView *tabs, BView *view, const char *label, const char *icon)
     {
-        BTab *tab = new BTab();
-        tabs->AddTab(view, tab);
-        tab->SetLabel(label);
+        tabs->AddTab(view, settings_icon_tab(view, haiku_icon(icon), label));
     }
 
     /* Qt: updateLptPortControls() / updateComPortControls(). */

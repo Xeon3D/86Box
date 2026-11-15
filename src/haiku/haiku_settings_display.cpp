@@ -39,6 +39,7 @@
 
 #include "haiku_deviceconfig.hpp"
 #include "haiku_settings.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 #include "haiku_settings_display.hpp"
 
@@ -437,7 +438,7 @@ private:
                 .SetColumnWeight(1, 1.0f)
             .End()
             .AddGlue();
-        tabs->AddTab(general);
+        tabs->AddTab(general, settings_icon_tab(general, haiku_icon("general_display")));
 
         /* The two radio buttons share the box as their parent, which makes
            them exclude each other. */
@@ -469,7 +470,7 @@ private:
             .Add(inverted)
             .Add(contrast)
             .AddGlue();
-        tabs->AddTab(monitor);
+        tabs->AddTab(monitor, settings_icon_tab(monitor, haiku_icon("monitor")));
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)

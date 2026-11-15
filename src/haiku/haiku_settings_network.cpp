@@ -25,6 +25,7 @@
 #include <string>
 
 #include "haiku_deviceconfig.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -114,9 +115,7 @@ public:
                 .AddGlue();
 
             snprintf(name, sizeof(name), "Adapter %i", i + 1);
-            BTab *t = new BTab();
-            tabs->AddTab(tab, t);
-            t->SetLabel(name);
+            tabs->AddTab(tab, settings_icon_tab(tab, haiku_icon("network"), name));
 
             FillTypes(i);
         }

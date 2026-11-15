@@ -25,6 +25,7 @@
 #include <string>
 
 #include "haiku_deviceconfig.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -156,9 +157,9 @@ public:
         rom_view->GridLayout()->SetColumnWeight(1, 1.0f);
 
         BTabView *tabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-        tabs->AddTab(general);
-        tabs->AddTab(mem_view);
-        tabs->AddTab(rom_view);
+        tabs->AddTab(general, settings_icon_tab(general, haiku_icon("general_other_peripherals")));
+        tabs->AddTab(mem_view, settings_icon_tab(mem_view, haiku_icon("isa_memory")));
+        tabs->AddTab(rom_view, settings_icon_tab(rom_view, haiku_icon("isa_rom")));
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)

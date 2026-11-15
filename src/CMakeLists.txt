@@ -384,6 +384,38 @@ else()
     add_subdirectory(unix)
 endif()
 
+if(HAIKU)
+    # The application's resources, for every UI: its signature and the
+    # 86Box icon as a vector icon (haiku/86Box.rdef, made from the 32x32 PNG
+    # by haiku/png2hvif.py). rc compiles them, xres adds them to the binary
+    # and mimeset updates its attributes, so Tracker and the Deskbar show
+    # the icon. Each UI has its own signature, so both can be installed.
+    if(HAIKU_NATIVE)
+        set(HAIKU_SIGNATURE application/x-vnd.86Box)
+    elseif(QT)
+        set(HAIKU_SIGNATURE application/x-vnd.86Box-Qt)
+    else()
+        set(HAIKU_SIGNATURE application/x-vnd.86Box-SDL)
+    endif()
+    find_program(HAIKU_RC rc REQUIRED)
+    find_program(HAIKU_XRES xres REQUIRED)
+    find_program(HAIKU_MIMESET mimeset REQUIRED)
+    set(HAIKU_SIGNATURE_RDEF ${CMAKE_CURRENT_BINARY_DIR}/86Box-signature.rdef)
+    set(HAIKU_RSRC ${CMAKE_CURRENT_BINARY_DIR}/86Box.rsrc)
+    file(GENERATE OUTPUT ${HAIKU_SIGNATURE_RDEF}
+        CONTENT "resource app_signature \"${HAIKU_SIGNATURE}\";\n")
+    add_custom_command(OUTPUT ${HAIKU_RSRC}
+        COMMAND ${HAIKU_RC} -o ${HAIKU_RSRC} ${HAIKU_SIGNATURE_RDEF} ${CMAKE_CURRENT_SOURCE_DIR}/haiku/86Box.rdef
+        DEPENDS ${HAIKU_SIGNATURE_RDEF} ${CMAKE_CURRENT_SOURCE_DIR}/haiku/86Box.rdef
+        COMMENT "Compiling the Haiku resources")
+    add_custom_target(haiku_resources DEPENDS ${HAIKU_RSRC})
+    add_dependencies(86Box haiku_resources)
+    add_custom_command(TARGET 86Box POST_BUILD
+        COMMAND ${HAIKU_XRES} -o $<TARGET_FILE:86Box> ${HAIKU_RSRC}
+        COMMAND ${HAIKU_MIMESET} -f $<TARGET_FILE:86Box>
+        COMMENT "Adding the icon to 86Box")
+endif()
+
 if(CMAKE_SYSTEM_NAME MATCHES "NetBSD")
     add_custom_command(TARGET 86Box POST_BUILD COMMAND paxctl ARGS +m $<TARGET_FILE:86Box> COMMENT "Disable PaX MPROTECT")
 endif()

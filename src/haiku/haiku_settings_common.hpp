@@ -119,7 +119,8 @@ private:
 };
 
 /* A tab with an icon before its label, like Qt's tab icons. */
-BTab *settings_icon_tab(BView *view, BBitmap *icon);
+/* The label is the view's name unless one is given. */
+BTab *settings_icon_tab(BView *view, BBitmap *icon, const char *label = nullptr);
 
 /* The name the Qt UI shows for a device (DeviceConfig::DeviceName): "None"
    and "Internal device" for those internal names, "[bus] name" for bus 1,

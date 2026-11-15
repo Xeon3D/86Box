@@ -32,6 +32,7 @@
 
 #include "haiku_deviceconfig.hpp"
 #include "haiku_settings.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -385,11 +386,10 @@ public:
 private:
     static int Checked(const BControl *control) { return (control->Value() == B_CONTROL_ON) ? 1 : 0; }
 
-    static void AddTab(BTabView *tabs, BView *view, const char *label)
+    /* A tab with Qt's icon for it. */
+    static void AddTab(BTabView *tabs, BView *view, const char *label, const char *icon)
     {
-        BTab *tab = new BTab();
-        tabs->AddTab(view, tab);
-        tab->SetLabel(label);
+        tabs->AddTab(view, settings_icon_tab(view, haiku_icon(icon), label));
     }
 
     void BuildLayout()
@@ -444,7 +444,7 @@ private:
             .End()
             .Add(time_box)
             .AddGlue();
-        AddTab(tabs, machine_tab, "Machine");
+        AddTab(tabs, machine_tab, "Machine", "machine_tab");
 
         /* Processor tab. */
         BGroupView *cpu_tab = new BGroupView(B_VERTICAL);
@@ -463,7 +463,7 @@ private:
                 .SetColumnWeight(1, 1.0f)
             .End()
             .AddGlue();
-        AddTab(tabs, cpu_tab, "Processor");
+        AddTab(tabs, cpu_tab, "Processor", "processor");
 
         /* Performance tab. */
         BBox *frame_box = new BBox("frame_box");
@@ -495,7 +495,7 @@ private:
             .Add(fast_forward)
             .Add(frame_box)
             .AddGlue();
-        AddTab(tabs, perf_tab, "Performance");
+        AddTab(tabs, perf_tab, "Performance", "performance");
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "haiku_deviceconfig.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -130,8 +131,8 @@ public:
         midi->GridLayout()->SetColumnWeight(1, 1.0f);
 
         BTabView *tabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-        tabs->AddTab(general);
-        tabs->AddTab(midi);
+        tabs->AddTab(general, settings_icon_tab(general, haiku_icon("general_sound")));
+        tabs->AddTab(midi, settings_icon_tab(midi, haiku_icon("midi")));
 
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
