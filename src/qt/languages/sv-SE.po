@@ -809,8 +809,8 @@ msgstr "Bandenhet:"
 msgid "ISA RTC:"
 msgstr "ISA realtidsklocka:"
 
-msgid "ISA Memory Expansion"
-msgstr "ISA minnesexpansion"
+msgid "ISA/MCA Memory Expansion"
+msgstr "ISA/MCA minnesexpansion"
 
 msgid "ISA ROM Cards"
 msgstr "ISA ROM-kort"
@@ -2578,6 +2578,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Startadress"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Angränsande storlek"

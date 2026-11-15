@@ -808,8 +808,8 @@ msgstr "磁帶機:"
 msgid "ISA RTC:"
 msgstr "ISA 實時時鐘:"
 
-msgid "ISA Memory Expansion"
-msgstr "ISA 記憶體擴充"
+msgid "ISA/MCA Memory Expansion"
+msgstr "ISA/MCA 記憶體擴充"
 
 msgid "ISA ROM Cards"
 msgstr "ISA ROM 擴充卡"
@@ -2583,6 +2583,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "起始位址"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "連續大小"

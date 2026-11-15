@@ -807,8 +807,8 @@ msgstr "Lecteurs de bandes :"
 msgid "ISA RTC:"
 msgstr "Horloge temps réel ISA :"
 
-msgid "ISA Memory Expansion"
-msgstr "Extension de la mémoire ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Extension de la mémoire ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Cartes ROM ISA"
@@ -2581,6 +2581,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Adresse de départ"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Taille contiguë"

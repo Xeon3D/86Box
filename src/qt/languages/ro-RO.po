@@ -809,8 +809,8 @@ msgstr "Unități de bandă:"
 msgid "ISA RTC:"
 msgstr "ISA RTC:"
 
-msgid "ISA Memory Expansion"
-msgstr "Expansiune de memorie ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Expansiune de memorie ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Plăci ROM ISA"
@@ -2674,6 +2674,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Adresă de pornire"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Dimensiune contiguă"

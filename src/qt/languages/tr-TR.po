@@ -807,8 +807,8 @@ msgstr "Teyp sürücüleri:"
 msgid "ISA RTC:"
 msgstr "ISA RTC:"
 
-msgid "ISA Memory Expansion"
-msgstr "ISA Bellek (RAM) Artırıcı"
+msgid "ISA/MCA Memory Expansion"
+msgstr "ISA/MCA Bellek (RAM) Artırıcı"
 
 msgid "ISA ROM Cards"
 msgstr "ISA ROM Kartları"
@@ -2618,6 +2618,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Başlangıç adresi"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Bitişik boyut"

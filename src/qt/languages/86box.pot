@@ -801,7 +801,7 @@ msgstr ""
 msgid "ISA RTC:"
 msgstr ""
 
-msgid "ISA Memory Expansion"
+msgid "ISA/MCA Memory Expansion"
 msgstr ""
 
 msgid "ISA ROM Cards"
@@ -2546,6 +2546,9 @@ msgid "SLI"
 msgstr ""
 
 msgid "Start Address"
+msgstr ""
+
+msgid "Allow RAM up to the system ROM"
 msgstr ""
 
 msgid "Contiguous Size"

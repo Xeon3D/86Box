@@ -807,8 +807,8 @@ msgstr "Unitats de cinta:"
 msgid "ISA RTC:"
 msgstr "ISA RTC:"
 
-msgid "ISA Memory Expansion"
-msgstr "Expansió de memòria ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Expansió de memòria ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Targetes ROM ISA"
@@ -2563,6 +2563,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Adreça inicial"
+
+msgid "Allow RAM up to the system ROM"
+msgstr "Permet RAM fins a la ROM del sistema"
 
 msgid "Contiguous Size"
 msgstr "Mida contígua"

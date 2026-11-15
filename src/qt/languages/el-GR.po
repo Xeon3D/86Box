@@ -809,8 +809,8 @@ msgstr "Οδηγοί ταινίας:"
 msgid "ISA RTC:"
 msgstr "ISA RTC:"
 
-msgid "ISA Memory Expansion"
-msgstr "Επέκταση Μνήμης ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Επέκταση Μνήμης ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Κάρτες ROM ISA"
@@ -2602,6 +2602,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Διεύθυνση εκκίνησης"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Μέγεθος συνέχειας"

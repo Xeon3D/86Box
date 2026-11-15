@@ -810,8 +810,8 @@ msgstr "Napędy taśmowe:"
 msgid "ISA RTC:"
 msgstr "ISA RTC:"
 
-msgid "ISA Memory Expansion"
-msgstr "Rozszerzenie pamięci ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Rozszerzenie pamięci ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Karty ROM ISA"
@@ -2575,6 +2575,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Adres początkowy"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Przyległy rozmiar"

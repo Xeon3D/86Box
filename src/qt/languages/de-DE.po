@@ -807,8 +807,8 @@ msgstr "Bandlaufwerke:"
 msgid "ISA RTC:"
 msgstr "ISA-Echtzeituhr:"
 
-msgid "ISA Memory Expansion"
-msgstr "ISA-Speichererweiterung"
+msgid "ISA/MCA Memory Expansion"
+msgstr "ISA/MCA-Speichererweiterung"
 
 msgid "ISA ROM Cards"
 msgstr "ISA-ROM-Karte"
@@ -2567,6 +2567,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Startadresse"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Zusammenhängende Größe"

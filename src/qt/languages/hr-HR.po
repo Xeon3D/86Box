@@ -809,8 +809,8 @@ msgstr "Trakaške jednote:"
 msgid "ISA RTC:"
 msgstr "Sat stvarnog vremena (RTC):"
 
-msgid "ISA Memory Expansion"
-msgstr "Proširenje memorije ISA"
+msgid "ISA/MCA Memory Expansion"
+msgstr "Proširenje memorije ISA/MCA"
 
 msgid "ISA ROM Cards"
 msgstr "Kartice ISA sa ROM-om"
@@ -2572,6 +2572,9 @@ msgstr "SLI"
 
 msgid "Start Address"
 msgstr "Početna adresa"
+
+msgid "Allow RAM up to the system ROM"
+msgstr ""
 
 msgid "Contiguous Size"
 msgstr "Susjedna veličina"
