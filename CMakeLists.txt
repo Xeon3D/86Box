@@ -116,6 +116,11 @@ endif()
 include(DetectTargetArch)
 include(CompilerFlags)
 
+if(HAIKU)
+    # Set by the Haiku release builds (PKGREV); empty for other builds.
+    set(HAIKU_RELEASE "" CACHE STRING "Haiku release number shown in the About box")
+endif()
+
 # Optional features
 #
 #      Option       Description                                                  Def.

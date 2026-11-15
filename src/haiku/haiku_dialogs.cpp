@@ -264,7 +264,7 @@ haiku_about_dialog(BWindow *)
 
     snprintf(title, sizeof(title), "About %s", EMU_NAME);
     snprintf(text, sizeof(text),
-             "%s v%s [%s, %s]\n\n"
+             "%s v%s [%s, %s]%s\n\n"
              "An emulator of old computers\n\n"
              "Authors: Miran Gr\xc4\x8d" "a (OBattler), RichardG867, Jasmine Iwanek, TC1995, coldbrewed, "
              "Teemu Korhonen (Manaatti), Joakim L. Gilje, Adrien Moulin (elyosh), Daniel Balsom (gloriouscow), "
@@ -274,9 +274,14 @@ haiku_about_dialog(BWindow *)
              "Released under the GNU General Public License version 2 or later. See LICENSE for more information.",
              EMU_NAME, EMU_VERSION_FULL, "x86_64",
 #ifdef USE_DYNAREC
-             "Dynamic Recompiler"
+             "Dynamic Recompiler",
 #else
-             "Interpreter"
+             "Interpreter",
+#endif
+#ifdef HAIKU_RELEASE
+             "\nHaiku release " HAIKU_RELEASE
+#else
+             ""
 #endif
     );
 

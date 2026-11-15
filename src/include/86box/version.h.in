@@ -31,6 +31,8 @@
 #cmakedefine EMU_BUILD     "@EMU_BUILD@"
 #define EMU_BUILD_NUM      @EMU_BUILD_NUM@
 #cmakedefine EMU_GIT_HASH  "@EMU_GIT_HASH@"
+/* The release number of a Haiku package build, shown in the About box. */
+#cmakedefine HAIKU_RELEASE "@HAIKU_RELEASE@"
 
 #ifdef BETA_BUILD
 # define EMU_VERSION_SUFFIX " Beta"
