@@ -260,7 +260,9 @@ SettingsWindow::MessageReceived(BMessage *message)
 
 /* Like Settings::accept(): nothing changed closes the window; otherwise
    confirm the hard reset, write the pages to the core and let the main
-   window reset the machine. */
+   window reset the machine. In settings-only mode OK always saves, as Qt's
+   main() does: a machine the VM manager has just created has no
+   configuration file yet, and without one the manager can't list it. */
 void
 SettingsWindow::Accept()
 {
@@ -268,7 +270,7 @@ SettingsWindow::Accept()
     for (SettingsPage *page : pages)
         changed |= page->Changed();
 
-    if (!changed) {
+    if (!changed && (owner != nullptr)) {
         Finish(false);
         return;
     }
