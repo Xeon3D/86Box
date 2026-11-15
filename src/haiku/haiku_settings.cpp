@@ -133,17 +133,20 @@ private:
 };
 
 SettingsWindow::SettingsWindow(BWindow *owner)
-    : BWindow(BRect(0, 0, 720, 480), "Settings", B_TITLED_WINDOW_LOOK, B_MODAL_SUBSET_WINDOW_FEEL,
+    : BWindow(BRect(0, 0, 720, 480), "Settings", B_TITLED_WINDOW_LOOK,
+              (owner != nullptr) ? B_MODAL_SUBSET_WINDOW_FEEL : B_NORMAL_WINDOW_FEEL,
               B_NOT_ZOOMABLE | B_AUTO_UPDATE_SIZE_LIMITS | B_ASYNCHRONOUS_CONTROLS | B_CLOSE_ON_ESCAPE)
     , owner(owner)
     , finished(false)
 {
     /* Without an owner (settings-only mode, -S) it is an ordinary window
-       and quits the application when closed. */
+       and quits the application when closed. It gets that feel when it is
+       created: a modal subset window has no workspaces of its own, and
+       newer Haiku keeps it on none after a SetFeel(), so it never shows. */
     if (owner != nullptr)
         AddToSubset(owner);
     else
-        SetFeel(B_NORMAL_WINDOW_FEEL);
+        SetWorkspaces(B_CURRENT_WORKSPACE);
     settings_set_current_machine(machine);
 
     SettingsPage *const created[] = {
