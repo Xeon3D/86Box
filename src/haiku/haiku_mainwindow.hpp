@@ -25,6 +25,7 @@ class BMenu;
 class BMenuBar;
 class BMenuItem;
 class BStringView;
+class IconMenuItem;
 class MachineStatusView;
 class MediaMenu;
 class RendererView;
@@ -103,7 +104,8 @@ private:
     BMenu     *gl_scale_menu;
     BMenu     *input_device_menu;
     BMenu     *tablet_tool_menu;
-    BMenuItem *item_pause;
+    IconMenuItem *item_pause;
+    IconMenuItem *item_force_interpreter;
     BMenuItem *item_mute;
 
     float   menu_height;

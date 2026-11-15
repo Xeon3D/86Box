@@ -47,6 +47,8 @@
 #include "haiku_machinestatus.hpp"
 #include "haiku_mainwindow.hpp"
 #include "haiku_monitorwindow.hpp"
+#include "haiku_iconmenuitem.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_osd.hpp"
 
 #ifdef MTR_ENABLED
@@ -171,6 +173,25 @@ static BMenuItem *
 add_item(BMenu *menu, const char *label, uint32 what, char shortcut = 0)
 {
     BMenuItem *item = new BMenuItem(label, new BMessage(what), shortcut);
+    menu->AddItem(item);
+    return item;
+}
+
+/* An item with one of Qt's menu icons (by its .ico name). */
+static IconMenuItem *
+add_icon_item(BMenu *menu, const char *label, uint32 what, const char *icon)
+{
+    IconMenuItem *item = new IconMenuItem(label, new BMessage(what), haiku_icon(icon));
+    menu->AddItem(item);
+    return item;
+}
+
+static IconMenuItem *
+add_icon_item_int(BMenu *menu, const char *label, uint32 what, const char *field, int32 value, const char *icon)
+{
+    BMessage *msg = new BMessage(what);
+    msg->AddInt32(field, value);
+    IconMenuItem *item = new IconMenuItem(label, msg, haiku_icon(icon));
     menu->AddItem(item);
     return item;
 }
@@ -424,53 +445,45 @@ MainWindow::BuildMenus()
 {
     menu_bar = new BMenuBar(BRect(0, 0, Bounds().Width(), 0), "menu_bar");
 
-    /* Action */
+    /* Action (Qt's menuAction, in its order) */
     BMenu *action = new BMenu("Action");
-    tablet_tool_menu = new BMenu("Tablet tool");
-    tablet_tool_menu->SetRadioMode(true);
-    add_item_int(tablet_tool_menu, "Pen", MSG_TABLET_TOOL, "tool", 1);
-    add_item_int(tablet_tool_menu, "Cursor/Puck", MSG_TABLET_TOOL, "tool", 0);
-    action->AddItem(tablet_tool_menu);
+    add_item(action, "Keyboard requires capture", MSG_KBD_CAPTURE);
+    add_item(action, "Right CTRL is left ALT", MSG_RCTRL_IS_LALT);
+    action->AddSeparatorItem();
+    add_item(action, "Update mouse every CPU frame", MSG_MOUSE_EVERY_FRAME);
     input_device_menu = new BMenu("Input device");
     input_device_menu->SetRadioMode(true);
     add_item_int(input_device_menu, "Mouse", MSG_INPUT_DEVICE, "mode", 0);
     add_item_int(input_device_menu, "Tablet", MSG_INPUT_DEVICE, "mode", 1);
     add_item_int(input_device_menu, "Tablet (Crosshair)", MSG_INPUT_DEVICE, "mode", 2);
     action->AddItem(input_device_menu);
-    add_item(action, "Keyboard requires capture", MSG_KBD_CAPTURE);
-    add_item(action, "Right CTRL is left ALT", MSG_RCTRL_IS_LALT);
+    tablet_tool_menu = new BMenu("Tablet tool");
+    tablet_tool_menu->SetRadioMode(true);
+    add_item_int(tablet_tool_menu, "Pen", MSG_TABLET_TOOL, "tool", 1);
+    add_item_int(tablet_tool_menu, "Cursor/Puck", MSG_TABLET_TOOL, "tool", 0);
+    action->AddItem(tablet_tool_menu);
     action->AddSeparatorItem();
-    add_item(action, "Update mouse every CPU frame", MSG_MOUSE_EVERY_FRAME);
-    action->AddSeparatorItem();
-    item_pause = add_item(action, "Pause", MSG_PAUSE);
+    item_pause = add_icon_item(action, "Pause", MSG_PAUSE, "pause");
     action->AddSeparatorItem();
     add_item(action, "Fullscreen", MSG_FULLSCREEN);
     add_item(action, "Toggle on-screen display", MSG_TOGGLE_OSD);
     action->AddSeparatorItem();
-    add_item(action, "Fast forward", MSG_FAST_FORWARD);
+    add_icon_item(action, "Fast forward", MSG_FAST_FORWARD, "fast_forward");
     add_item(action, "Fast forward at startup", MSG_FAST_FORWARD_START);
-    add_item(action, "Force interpretation", MSG_FORCE_INTERPRETER);
+    item_force_interpreter = add_icon_item(action, "Force interpretation", MSG_FORCE_INTERPRETER, "interpreter");
     action->AddSeparatorItem();
-    add_item(action, "Hard reset", MSG_HARD_RESET);
-    add_item(action, "Ctrl+Alt+Del", MSG_CTRL_ALT_DEL);
+    add_icon_item(action, "Hard reset", MSG_HARD_RESET, "hard_reset");
+    add_icon_item(action, "Ctrl+Alt+Del", MSG_CTRL_ALT_DEL, "send_cad");
     action->AddSeparatorItem();
-    add_item(action, "Ctrl+Alt+Esc", MSG_CTRL_ALT_ESC);
+    add_icon_item(action, "Ctrl+Alt+Esc", MSG_CTRL_ALT_ESC, "send_cae");
     add_item(action, "Non-maskable interrupt", MSG_NMI);
     action->AddSeparatorItem();
-    add_item(action, "ACPI shutdown", MSG_ACPI_SHUTDOWN);
+    add_icon_item(action, "ACPI shutdown", MSG_ACPI_SHUTDOWN, "acpi_shutdown");
     add_item(action, "Exit", B_QUIT_REQUESTED, 'Q');
     menu_bar->AddItem(action);
 
-    /* View */
+    /* View (Qt's menuView, in its order; no HiDPI scaling or Vulkan) */
     BMenu *view = new BMenu("View");
-    renderer_menu = new BMenu("Renderer");
-    renderer_menu->SetRadioMode(true);
-    for (int i = 0; i < haiku_renderer_count(); i++) {
-        const haiku_renderer_choice choice = haiku_renderer_at(i);
-        add_item_int(renderer_menu, choice.name, MSG_RENDERER, "api", choice.vid_api);
-    }
-    view->AddItem(renderer_menu);
-    view->AddSeparatorItem();
     add_item(view, "Hide toolbar", MSG_HIDE_TOOL_BAR);
     add_item(view, "Hide status bar", MSG_HIDE_STATUS_BAR);
     add_item(view, "Show non-primary monitors", MSG_SECOND_MONITORS);
@@ -480,16 +493,7 @@ MainWindow::BuildMenus()
     add_item(view, "Specify dimensions" B_UTF8_ELLIPSIS, MSG_SPECIFY_DIMENSIONS);
     add_item(view, "Force 4:3 display ratio", MSG_FORCE_43);
     add_item(view, "Force machine display ratio", MSG_FORCE_DEVICE_ASPECT);
-    scale_menu = new BMenu("Window scale factor");
-    scale_menu->SetRadioMode(true);
-    for (int i = 0; i < 10; i++)
-        add_item_int(scale_menu, scale_names[i], MSG_SCALE, "scale", i);
-    view->AddItem(scale_menu);
-    filter_menu = new BMenu("Filter method");
-    filter_menu->SetRadioMode(true);
-    add_item_int(filter_menu, "Nearest", MSG_FILTER, "filter", 0);
-    add_item_int(filter_menu, "Linear", MSG_FILTER, "filter", 1);
-    view->AddItem(filter_menu);
+    view->AddSeparatorItem();
     stretch_menu = new BMenu("Fullscreen stretch mode");
     stretch_menu->SetRadioMode(true);
     add_item_int(stretch_menu, "Full screen stretch", MSG_STRETCH_MODE, "mode", FULLSCR_SCALE_FULL);
@@ -501,6 +505,29 @@ MainWindow::BuildMenus()
     add_item_int(stretch_menu, "Center", MSG_STRETCH_MODE, "mode", FULLSCR_SCALE_CENTER);
     add_item_int(stretch_menu, "4:3 Center", MSG_STRETCH_MODE, "mode", FULLSCR_SCALE_CENTER43);
     view->AddItem(stretch_menu);
+    add_item(view, "Apply fullscreen stretch mode when maximized", MSG_STRETCH_MAXIMIZED);
+    add_item(view, "CGA composite settings" B_UTF8_ELLIPSIS, MSG_CGA_SETTINGS);
+    view->AddSeparatorItem();
+    scale_menu = new BMenu("Window scale factor");
+    scale_menu->SetRadioMode(true);
+    for (int i = 0; i < 10; i++)
+        add_item_int(scale_menu, scale_names[i], MSG_SCALE, "scale", i);
+    view->AddItem(scale_menu);
+    view->AddSeparatorItem();
+    filter_menu = new BMenu("Filter method");
+    filter_menu->SetRadioMode(true);
+    add_item_int(filter_menu, "Nearest", MSG_FILTER, "filter", 0);
+    add_item_int(filter_menu, "Linear", MSG_FILTER, "filter", 1);
+    view->AddItem(filter_menu);
+    view->AddSeparatorItem();
+    renderer_menu = new BMenu("Renderer");
+    renderer_menu->SetRadioMode(true);
+    for (int i = 0; i < haiku_renderer_count(); i++) {
+        const haiku_renderer_choice choice = haiku_renderer_at(i);
+        add_item_int(renderer_menu, choice.name, MSG_RENDERER, "api", choice.vid_api);
+    }
+    view->AddItem(renderer_menu);
+    add_item(view, "Renderer options" B_UTF8_ELLIPSIS, MSG_RENDERER_OPTIONS);
     gl_stretch_menu = new BMenu("OpenGL input stretch mode");
     gl_stretch_menu->SetRadioMode(true);
     add_item_int(gl_stretch_menu, "Full screen stretch", MSG_GL_STRETCH, "mode", FULLSCR_SCALE_FULL);
@@ -516,21 +543,28 @@ MainWindow::BuildMenus()
     for (int i = 0; i < 10; i++)
         add_item_int(gl_scale_menu, scale_names[i], MSG_GL_SCALE, "scale", gl_scales_x2[i]);
     view->AddItem(gl_scale_menu);
-    view->AddSeparatorItem();
-    add_item(view, "Apply fullscreen stretch mode when maximized", MSG_STRETCH_MAXIMIZED);
-    add_item(view, "CGA composite settings" B_UTF8_ELLIPSIS, MSG_CGA_SETTINGS);
-    view->AddSeparatorItem();
-    add_item(view, "Renderer options" B_UTF8_ELLIPSIS, MSG_RENDERER_OPTIONS);
     menu_bar->AddItem(view);
 
     /* Media: filled by MediaMenu when the menu bar opens. */
     media_menu = new BMenu("Media");
     menu_bar->AddItem(media_menu);
 
-    /* Tools */
+    /* Tools (Qt's menuTools, in its order) */
     BMenu *tools = new BMenu("Tools");
+    add_icon_item(tools, "Settings" B_UTF8_ELLIPSIS, MSG_SETTINGS, "settings");
+    add_item(tools, "Update status bar icons", MSG_UPDATE_ICONS);
+    tools->AddSeparatorItem();
+    add_icon_item_int(tools, "Take screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_NORMAL, "take_screenshot");
+    add_icon_item_int(tools, "Take raw screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_RAW, "take_raw_screenshot");
+    add_icon_item_int(tools, "Copy screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_COPY, "copy_screenshot");
+    add_icon_item_int(tools, "Copy raw screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_COPY_RAW, "copy_raw_screenshot");
+    tools->AddSeparatorItem();
     BMenu *sound = new BMenu("Sound");
-    midi_menu    = new BMenu("MIDI output device");
+    item_mute = add_item(sound, "Mute", MSG_MUTE);
+    sound->AddSeparatorItem();
+    add_item(sound, "Sound gain" B_UTF8_ELLIPSIS, MSG_SOUND_GAIN);
+    sound->AddSeparatorItem();
+    midi_menu = new BMenu("MIDI output device");
     midi_menu->SetRadioMode(false);
     sound->AddItem(midi_menu);
     midi_command_menu = new BMenu("Send MIDI command");
@@ -541,18 +575,7 @@ MainWindow::BuildMenus()
     midi_command_menu->AddSeparatorItem();
     add_item_int(midi_command_menu, "All notes off", MSG_MIDI_COMMAND, "command", MIDI_CMD_ALL_NOTES_OFF);
     sound->AddItem(midi_command_menu);
-    item_mute = add_item(sound, "Mute", MSG_MUTE);
-    sound->AddSeparatorItem();
-    add_item(sound, "Sound gain" B_UTF8_ELLIPSIS, MSG_SOUND_GAIN);
     tools->AddItem(sound);
-    tools->AddSeparatorItem();
-    add_item(tools, "Settings" B_UTF8_ELLIPSIS, MSG_SETTINGS);
-    add_item(tools, "Update status bar icons", MSG_UPDATE_ICONS);
-    tools->AddSeparatorItem();
-    add_item_int(tools, "Take screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_NORMAL);
-    add_item_int(tools, "Take raw screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_RAW);
-    add_item_int(tools, "Copy screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_COPY);
-    add_item_int(tools, "Copy raw screenshot", MSG_SCREENSHOT_KIND, "kind", SHOT_COPY_RAW);
     tools->AddSeparatorItem();
     add_item(tools, "Preferences" B_UTF8_ELLIPSIS, MSG_PREFERENCES);
     tools->AddSeparatorItem();
@@ -613,7 +636,6 @@ MainWindow::MenusBeginning()
     set_marked(root, MSG_MOUSE_EVERY_FRAME, force_constant_mouse);
     set_marked(root, MSG_FAST_FORWARD, runctl_mode() == RUN_MODE_FAST);
     set_marked(root, MSG_FAST_FORWARD_START, fast_forward_on_start);
-    set_marked(root, MSG_FORCE_INTERPRETER, cpu_force_interpreter);
     set_marked(root, MSG_HIDE_TOOL_BAR, hide_tool_bar);
     set_marked(root, MSG_HIDE_STATUS_BAR, hide_status_bar);
     set_marked(root, MSG_SECOND_MONITORS, show_second_monitors);
@@ -630,7 +652,11 @@ MainWindow::MenusBeginning()
     set_enabled(root, MSG_RESIZABLE, vid_resize != 2);
     scale_menu->SetEnabled(vid_resize == 0);
 
+    /* Qt updateUiPauseState() and forceInterpretationCompleted. */
     item_pause->SetLabel((runctl_state() == RUN_PAUSED) ? "Resume" : "Pause");
+    item_pause->SetIcon(haiku_icon((runctl_state() == RUN_PAUSED) ? "run" : "pause"));
+    item_force_interpreter->SetLabel(cpu_force_interpreter ? "Allow recompilation" : "Force interpretation");
+    item_force_interpreter->SetIcon(haiku_icon(cpu_force_interpreter ? "recompiler" : "interpreter"));
 
     /* As MainWindow::refreshMediaMenu() / updatePowerOffAction() in Qt
        (items Qt hides are disabled here). */

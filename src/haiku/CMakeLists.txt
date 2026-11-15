@@ -53,6 +53,20 @@ set(HAIKU_ICONS
     pause run fast_forward hard_reset acpi_shutdown send_cad send_cae
     settings take_screenshot copy_screenshot take_raw_screenshot
     copy_raw_screenshot eject browse new
+    # media menu (qt_mediamenu.cpp)
+    cassette_image cartridge_image floppy_35_image floppy_525_image record
+    rewind export rdisk_image zip_image jaz_image syquest_image mo_image
+    tape_image
+    cdrom_image cdrom_folder cdrom_host cdrom_unmute
+    cdr cdr_image cdr_folder cdr_host cdr_unmute
+    cdrw cdrw_image cdrw_folder cdrw_host cdrw_unmute
+    dvdrom dvdrom_image dvdrom_folder dvdrom_host dvdrom_unmute
+    hd_dvdrom hd_dvdrom_image hd_dvdrom_folder hd_dvdrom_host hd_dvdrom_unmute
+    bdrom bdrom_image bdrom_folder bdrom_host bdrom_unmute
+    # Settings: page list, tabs and drive lists
+    machine display input_devices ports storage_controllers
+    floppy_and_cdrom_drives other_removable_devices other_peripherals
+    floppy_tab
     # VM manager
     86Box-gray new_vm
 )
@@ -77,6 +91,7 @@ file(CONFIGURE OUTPUT ${HAIKU_ICON_SOURCE} CONTENT "${HAIKU_ICON_CODE}" @ONLY)
 add_library(ui OBJECT
     haiku_dialogs.cpp
     haiku_iconcache.cpp
+    haiku_iconmenuitem.cpp
     haiku_keyboardgrab.cpp
     haiku_main.cpp
     haiku_mainwindow.cpp

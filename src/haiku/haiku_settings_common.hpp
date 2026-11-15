@@ -31,13 +31,18 @@
 #ifndef HAIKU_SETTINGS_COMMON_HPP
 #define HAIKU_SETTINGS_COMMON_HPP
 
+#include <ListItem.h>
 #include <MenuField.h>
 #include <MenuItem.h>
 #include <PopUpMenu.h>
 #include <View.h>
 
 #include <string>
+#include <vector>
 
+class BBitmap;
+class BListView;
+class BTab;
 class SettingsWindow;
 struct _device_;
 
@@ -72,6 +77,49 @@ private:
     BPopUpMenu *menu;
     uint32      what;
 };
+
+/* A row of a drive list shown like Qt's QTreeView: an icon (Qt's
+   DecorationRole) in the first column, then one text per column. The
+   columns take the given fractions of the width; settings_column_list()
+   puts the matching header above the list. */
+class SettingsColumnItem : public BListItem {
+public:
+    explicit SettingsColumnItem(const std::vector<float> &fractions);
+
+    void SetIcon(BBitmap *icon) { this->icon = icon; }
+    void SetText(size_t column, const std::string &text);
+
+    void DrawItem(BView *owner, BRect frame, bool complete) override;
+    void Update(BView *owner, const BFont *font) override;
+
+private:
+    std::vector<float>       fractions;
+    std::vector<std::string> texts;
+    BBitmap                 *icon;
+};
+
+/* The column titles and the list in its scroll view, as one view. */
+BView *settings_column_list(const char *name, BListView *list, const std::vector<const char *> &titles,
+                            const std::vector<float> &fractions);
+
+/* A list item with an icon before its text (the Settings page list). */
+class SettingsIconItem : public BListItem {
+public:
+    SettingsIconItem(const char *text, BBitmap *icon);
+
+    const char *Text() const { return text.c_str(); }
+    BBitmap    *Icon() const { return icon; }
+
+    void DrawItem(BView *owner, BRect frame, bool complete) override;
+    void Update(BView *owner, const BFont *font) override;
+
+private:
+    std::string text;
+    BBitmap    *icon;
+};
+
+/* A tab with an icon before its label, like Qt's tab icons. */
+BTab *settings_icon_tab(BView *view, BBitmap *icon);
 
 /* The name the Qt UI shows for a device (DeviceConfig::DeviceName): "None"
    and "Internal device" for those internal names, "[bus] name" for bus 1,

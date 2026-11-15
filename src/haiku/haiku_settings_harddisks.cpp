@@ -22,6 +22,8 @@
 #include <Button.h>
 #include <LayoutBuilder.h>
 #include <ListItem.h>
+
+#include <algorithm>
 #include <ListView.h>
 #include <ScrollView.h>
 #include <String.h>
@@ -36,6 +38,7 @@
 
 #include "haiku_harddiskdialog.hpp"
 #include "haiku_harddrive_common.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 
 /* The core headers are not self-contained: keep this order (as in Qt). */
@@ -103,8 +106,11 @@ column_edges(float left, float width, float edges[COLUMNS + 1])
         edges[i + 1] = edges[i] + (width * column_share[i]);
 }
 
+/* The rows have Qt's hard_disk icon before the bus (DecorationRole of the
+   first column); `icon` is nullptr for the header. */
 static void
-draw_columns(BView *view, const BRect &frame, const std::string *texts, float left, float width)
+draw_columns(BView *view, const BRect &frame, const std::string *texts, float left, float width,
+             BBitmap *icon = nullptr)
 {
     float edges[COLUMNS + 1];
     column_edges(left, width, edges);
@@ -114,9 +120,17 @@ draw_columns(BView *view, const BRect &frame, const std::string *texts, float le
     const float baseline = frame.top + ((frame.Height() + fh.ascent - fh.descent) / 2.0f);
 
     for (int i = 0; i < COLUMNS; i++) {
+        float x = edges[i] + 4;
+        if ((i == 0) && (icon != nullptr)) {
+            view->SetDrawingMode(B_OP_ALPHA);
+            view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+            view->DrawBitmapAsync(icon, BPoint(x, floorf(frame.top + ((frame.Height() - 15) / 2))));
+            view->SetDrawingMode(B_OP_COPY);
+            x += 20;
+        }
         BString text(texts[i].c_str());
-        view->TruncateString(&text, B_TRUNCATE_END, edges[i + 1] - edges[i] - 8);
-        view->DrawString(text.String(), BPoint(edges[i] + 4, baseline));
+        view->TruncateString(&text, B_TRUNCATE_END, edges[i + 1] - x - 4);
+        view->DrawString(text.String(), BPoint(x, baseline));
     }
 }
 
@@ -130,7 +144,7 @@ public:
         owner->SetLowColor(background);
         owner->FillRect(frame, B_SOLID_LOW);
         owner->SetHighColor(ui_color(IsSelected() ? B_LIST_SELECTED_ITEM_TEXT_COLOR : B_LIST_ITEM_TEXT_COLOR));
-        draw_columns(owner, frame, texts, frame.left, frame.Width());
+        draw_columns(owner, frame, texts, frame.left, frame.Width(), haiku_icon("hard_disk"));
     }
 
     void Update(BView *owner, const BFont *font) override
@@ -138,7 +152,7 @@ public:
         BListItem::Update(owner, font);
         font_height fh;
         font->GetHeight(&fh);
-        SetHeight(ceilf(fh.ascent + fh.descent + fh.leading) + 6);
+        SetHeight(std::max(20.0f, ceilf(fh.ascent + fh.descent + fh.leading) + 6));
     }
 };
 

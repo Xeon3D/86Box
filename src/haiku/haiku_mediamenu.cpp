@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+#include "haiku_iconmenuitem.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_mediamenu.hpp"
 #include "haiku_newflashdialog.hpp"
 #include "haiku_newfloppydialog.hpp"
@@ -207,9 +209,10 @@ drive_message(uint32 what, int type, int id)
 }
 
 static BMenuItem *
-add_item(BMenu *menu, const std::string &label, BMessage *msg, bool enabled = true, bool marked = false)
+add_item(BMenu *menu, const std::string &label, BMessage *msg, bool enabled = true, bool marked = false,
+         BBitmap *icon = nullptr)
 {
-    BMenuItem *item = new BMenuItem(label.c_str(), msg);
+    BMenuItem *item = (icon != nullptr) ? new IconMenuItem(label.c_str(), msg, icon) : new BMenuItem(label.c_str(), msg);
     item->SetEnabled(enabled);
     item->SetMarked(marked);
     menu->AddItem(item);
@@ -845,6 +848,88 @@ MediaMenu::Impl::Title(int type, int id) const
     return head + shown;
 }
 
+/* The icons of a drive's menu, as qt_mediamenu.cpp picks them: the image
+   icon (with Qt's indicators drawn over it: new, browse, eject,
+   write_protected), and for CD-ROM drives the folder, host drive, unmuted
+   and empty-drive icons by the drive type. */
+struct drive_icons {
+    const char *image;
+    const char *folder;
+    const char *host;
+    const char *unmute;
+    const char *drive;
+};
+
+static drive_icons
+icons_for(int type, int id)
+{
+    switch (type) {
+        case HAIKU_MEDIA_CASSETTE:
+            return { "cassette_image", nullptr, nullptr, nullptr, nullptr };
+        case HAIKU_MEDIA_CARTRIDGE:
+            return { "cartridge_image", nullptr, nullptr, nullptr, nullptr };
+        case HAIKU_MEDIA_FLOPPY:
+            return { fdd_is_525(&drives[id]) ? "floppy_525_image" : "floppy_35_image", nullptr, nullptr, nullptr, nullptr };
+        case HAIKU_MEDIA_CDROM:
+            {
+                const int t = cdrom[id].type;
+                if (cdrom_is_bd(t))
+                    return { "bdrom_image", "bdrom_folder", "bdrom_host", "bdrom_unmute", "bdrom" };
+                if (cdrom_is_hd_dvd(t))
+                    return { "hd_dvdrom_image", "hd_dvdrom_folder", "hd_dvdrom_host", "hd_dvdrom_unmute", "hd_dvdrom" };
+                if (cdrom_is_dvd(t))
+                    return { "dvdrom_image", "dvdrom_folder", "dvdrom_host", "dvdrom_unmute", "dvdrom" };
+                if (cdrom_is_cdrw(t))
+                    return { "cdrw_image", "cdrw_folder", "cdrw_host", "cdrw_unmute", "cdrw" };
+                if (cdrom_is_cdr(t))
+                    return { "cdr_image", "cdr_folder", "cdr_host", "cdr_unmute", "cdr" };
+                return { "cdrom_image", "cdrom_folder", "cdrom_host", "cdrom_unmute", "cdrom" };
+            }
+        case HAIKU_MEDIA_RDISK:
+            switch (rdisk_drives[id].type) {
+                case RDISK_TYPE_ZIP_100:
+                case RDISK_TYPE_ZIP_100_PLUS:
+                case RDISK_TYPE_ZIP_250:
+                case RDISK_TYPE_ZIP_750:
+                    return { "zip_image", nullptr, nullptr, nullptr, nullptr };
+                case RDISK_TYPE_JAZ_1GB:
+                case RDISK_TYPE_JAZ_2GB:
+                    return { "jaz_image", nullptr, nullptr, nullptr, nullptr };
+                case RDISK_TYPE_SYJET_1_5GB:
+                case RDISK_TYPE_SYJET_S:
+                case RDISK_TYPE_SPARQ_1GB:
+                case RDISK_TYPE_SQ5200C:
+                case RDISK_TYPE_SQ3105S:
+                case RDISK_TYPE_EZ230S:
+                case RDISK_TYPE_EZ135A:
+                case RDISK_TYPE_EZ230A:
+                case RDISK_TYPE_SQ3105A:
+                case RDISK_TYPE_SQ3270A:
+                case RDISK_TYPE_EZ135S:
+                case RDISK_TYPE_SQ3270S:
+                case RDISK_TYPE_SQ5110C:
+                case RDISK_TYPE_SQ555:
+                    return { "syquest_image", nullptr, nullptr, nullptr, nullptr };
+                default:
+                    return { "rdisk_image", nullptr, nullptr, nullptr, nullptr };
+            }
+        case HAIKU_MEDIA_MO:
+            return { "mo_image", nullptr, nullptr, nullptr, nullptr };
+        case HAIKU_MEDIA_TAPE:
+            return { "tape_image", nullptr, nullptr, nullptr, nullptr };
+        default:
+            return { nullptr, nullptr, nullptr, nullptr, nullptr };
+    }
+}
+
+/* The image icon with one of Qt's indicators over it. */
+static BBitmap *
+image_icon(int type, int id, const char *indicator = nullptr, const char *indicator2 = nullptr)
+{
+    const char *image = icons_for(type, id).image;
+    return (image != nullptr) ? haiku_icon_with(image, indicator, indicator2) : nullptr;
+}
+
 /* The recent images (MediaMenu::updateImageHistory()): one item per entry
    that still exists, numbered as Qt numbers them. */
 void
@@ -871,9 +956,15 @@ MediaMenu::Impl::AddHistory(BMenu *menu, int type, int id)
         char number[16];
         snprintf(number, sizeof(number), "%i ", (slot == 9) ? 0 : (slot + 1));
 
+        BBitmap *icon = nullptr;
+        if (type == HAIKU_MEDIA_CARTRIDGE)
+            icon = image_icon(type, id);
+        else if (type != HAIKU_MEDIA_CDROM)
+            icon = starts_with(fn, "wp://") ? image_icon(type, id, "write_protected") : image_icon(type, id);
+
         BMessage *msg = drive_message(MSG_MM_HISTORY, type, id);
         msg->AddInt32("slot", slot);
-        add_item(menu, number + name, msg);
+        add_item(menu, number + name, msg, true, false, icon);
     }
 }
 
@@ -889,7 +980,20 @@ MediaMenu::Impl::AddEject(BMenu *menu, int type, int id)
         else
             label += " " + leaf_name(name);
     }
-    add_item(menu, label, drive_message(MSG_MM_EJECT, type, id), !name.empty());
+    BBitmap *icon = image_icon(type, id, "eject");
+    if (type == HAIKU_MEDIA_CDROM) {
+        const drive_icons icons = icons_for(type, id);
+        const char       *base  = icons.image;
+        struct stat       st;
+        if (starts_with(name, "ioctl://"))
+            base = icons.host;
+        else if (name.empty())
+            base = icons.drive;
+        else if ((stat(cdrom[id].image_path, &st) == 0) && S_ISDIR(st.st_mode))
+            base = icons.folder;
+        icon = haiku_icon_with(base, "eject");
+    }
+    add_item(menu, label, drive_message(MSG_MM_EJECT, type, id), !name.empty(), false, icon);
 }
 
 void
@@ -901,26 +1005,32 @@ MediaMenu::Impl::Fill(BMenu *menu, int type, int id)
                 const bool has_image = (cassette_fname[0] != '\0');
                 const bool saving    = !strcmp(cassette_mode, "save");
 
-                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id));
+                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id), true, false,
+                         image_icon(type, id, "new"));
                 add_separator(menu);
-                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id));
+                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id), true, false,
+                         image_icon(type, id, "browse"));
                 BMessage *wp = drive_message(MSG_MM_EXISTING, type, id);
                 wp->AddBool("wp", true);
-                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp);
+                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp, true, false,
+                         image_icon(type, id, "write_protected", "browse"));
                 add_separator(menu);
                 AddHistory(menu, type, id);
                 add_separator(menu);
-                add_item(menu, "Record", new BMessage(MSG_MM_CAS_RECORD), has_image, saving);
-                add_item(menu, "Play", new BMessage(MSG_MM_CAS_PLAY), has_image, !saving);
-                add_item(menu, "Rewind to the beginning", new BMessage(MSG_MM_CAS_REWIND), has_image);
-                add_item(menu, "Fast forward to the end", new BMessage(MSG_MM_CAS_FFWD), has_image);
+                add_item(menu, "Record", new BMessage(MSG_MM_CAS_RECORD), has_image, saving, haiku_icon("record"));
+                add_item(menu, "Play", new BMessage(MSG_MM_CAS_PLAY), has_image, !saving, haiku_icon("run"));
+                add_item(menu, "Rewind to the beginning", new BMessage(MSG_MM_CAS_REWIND), has_image, false,
+                         haiku_icon("rewind"));
+                add_item(menu, "Fast forward to the end", new BMessage(MSG_MM_CAS_FFWD), has_image, false,
+                         haiku_icon("fast_forward"));
                 add_separator(menu);
                 AddEject(menu, type, id);
                 break;
             }
 
         case HAIKU_MEDIA_CARTRIDGE:
-            add_item(menu, "Image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id));
+            add_item(menu, "Image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id), true, false,
+                     image_icon(type, id, "browse"));
             add_separator(menu);
             AddHistory(menu, type, id);
             add_separator(menu);
@@ -931,13 +1041,17 @@ MediaMenu::Impl::Fill(BMenu *menu, int type, int id)
             {
                 fdd_drive_t *drv = &drives[id];
 
-                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id));
+                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id), true, false,
+                         image_icon(type, id, "new"));
                 add_separator(menu);
-                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id));
+                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id), true, false,
+                         image_icon(type, id, "browse"));
                 BMessage *wp = drive_message(MSG_MM_EXISTING, type, id);
                 wp->AddBool("wp", true);
-                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp);
-                add_item(menu, "Mount folder" B_UTF8_ELLIPSIS, drive_message(MSG_MM_FOLDER, type, id));
+                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp, true, false,
+                         image_icon(type, id, "write_protected", "browse"));
+                add_item(menu, "Mount folder" B_UTF8_ELLIPSIS, drive_message(MSG_MM_FOLDER, type, id), true, false,
+                         image_icon(type, id, "browse"));
                 add_separator(menu);
                 AddHistory(menu, type, id);
                 add_separator(menu);
@@ -945,11 +1059,12 @@ MediaMenu::Impl::Fill(BMenu *menu, int type, int id)
                 if ((host != nullptr) && (host[0] != '\0')) {
                     BMessage *msg = drive_message(MSG_MM_HOST_FLOPPY, type, id);
                     msg->AddString("path", (std::string("ioctl://") + host).c_str());
-                    add_item(menu, "Use Host Floppy Drive", msg);
+                    add_item(menu, "Use Host Floppy Drive", msg, true, false, image_icon(type, id));
                     add_separator(menu);
                 }
+                /* Qt's Export indicator is the eject icon. */
                 add_item(menu, "Export to 86F" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXPORT, type, id),
-                         (drv->image_path[0] != '\0') && !drv->folder_image);
+                         (drv->image_path[0] != '\0') && !drv->folder_image, false, image_icon(type, id, "eject"));
                 add_separator(menu);
                 AddEject(menu, type, id);
                 break;
@@ -959,22 +1074,26 @@ MediaMenu::Impl::Fill(BMenu *menu, int type, int id)
             {
                 const int t = cdrom[id].type;
 
-                add_item(menu, (cdrom[id].sound_on == 0) ? "Unmute" : "Mute", drive_message(MSG_MM_CD_MUTE, type, id));
+                const drive_icons icons = icons_for(type, id);
+                add_item(menu, (cdrom[id].sound_on == 0) ? "Unmute" : "Mute", drive_message(MSG_MM_CD_MUTE, type, id), true,
+                         false, haiku_icon((cdrom[id].sound_on == 0) ? icons.unmute : "cdrom_mute"));
                 if (cdrom_is_writable(t))
                     add_separator(menu);
                 if (cdrom_is_cdr(t)) {
                     BMessage *msg = drive_message(MSG_MM_CD_BLANK, type, id);
                     msg->AddInt32("blank", CD_BLANK_CDR);
-                    add_item(menu, "New CD-R image" B_UTF8_ELLIPSIS, msg);
+                    add_item(menu, "New CD-R image" B_UTF8_ELLIPSIS, msg, true, false, haiku_icon_with("cdrw_image", "new"));
                 }
                 if (cdrom_is_cdrw(t)) {
                     BMessage *msg = drive_message(MSG_MM_CD_BLANK, type, id);
                     msg->AddInt32("blank", CD_BLANK_CDRW);
-                    add_item(menu, "New CD-RW image" B_UTF8_ELLIPSIS, msg);
+                    add_item(menu, "New CD-RW image" B_UTF8_ELLIPSIS, msg, true, false, haiku_icon_with("cdrw_image", "new"));
                 }
                 add_separator(menu);
-                add_item(menu, "Image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id));
-                add_item(menu, "Folder" B_UTF8_ELLIPSIS, drive_message(MSG_MM_FOLDER, type, id));
+                add_item(menu, "Image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id), true, false,
+                         haiku_icon_with(icons.image, "browse"));
+                add_item(menu, "Folder" B_UTF8_ELLIPSIS, drive_message(MSG_MM_FOLDER, type, id), true, false,
+                         haiku_icon_with(icons.folder, "browse"));
                 add_separator(menu);
                 AddHistory(menu, type, id);
                 add_separator(menu);
@@ -986,12 +1105,15 @@ MediaMenu::Impl::Fill(BMenu *menu, int type, int id)
         case HAIKU_MEDIA_MO:
         case HAIKU_MEDIA_TAPE:
             {
-                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id));
+                add_item(menu, "New image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_NEW, type, id), true, false,
+                         image_icon(type, id, "new"));
                 add_separator(menu);
-                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id));
+                add_item(menu, "Existing image" B_UTF8_ELLIPSIS, drive_message(MSG_MM_EXISTING, type, id), true, false,
+                         image_icon(type, id, "browse"));
                 BMessage *wp = drive_message(MSG_MM_EXISTING, type, id);
                 wp->AddBool("wp", true);
-                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp);
+                add_item(menu, "Existing image (Write-protected)" B_UTF8_ELLIPSIS, wp, true, false,
+                         image_icon(type, id, "write_protected", "browse"));
                 add_separator(menu);
                 AddHistory(menu, type, id);
                 add_separator(menu);

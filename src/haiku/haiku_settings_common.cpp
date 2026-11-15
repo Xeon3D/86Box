@@ -13,6 +13,16 @@
  *          Copyright 2026 Marcos Alves.
  */
 #include <atomic> /* before the core headers: plat.h and video.h include it under C++ */
+#include <Bitmap.h>
+#include <LayoutBuilder.h>
+#include <ListView.h>
+#include <ScrollBar.h>
+#include <ScrollView.h>
+#include <String.h>
+#include <TabView.h>
+
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "haiku_settings_common.hpp"
@@ -165,4 +175,206 @@ void
 settings_set_current_machine(int m)
 {
     selected_machine = m;
+}
+
+/* ------------------------------------------------ lists with columns */
+
+static const float kIcon = 16.0f;
+
+/* Draw a 16x16 icon with its alpha channel. */
+static void
+draw_icon(BView *view, BBitmap *icon, float x, BRect row)
+{
+    if (icon == nullptr)
+        return;
+    const drawing_mode mode = view->DrawingMode();
+    view->SetDrawingMode(B_OP_ALPHA);
+    view->SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+    view->DrawBitmapAsync(icon, BPoint(x, floorf(row.top + ((row.Height() - kIcon + 1) / 2))));
+    view->SetDrawingMode(mode);
+}
+
+/* The left edge of each column, and the right edge of the last. */
+static std::vector<float>
+column_edges(const std::vector<float> &fractions, float left, float width)
+{
+    std::vector<float> edges;
+    float              x = left;
+    edges.push_back(x);
+    for (float f : fractions) {
+        x += floorf(f * width);
+        edges.push_back(x);
+    }
+    edges.back() = left + width;
+    return edges;
+}
+
+static float
+row_height(const BFont *font)
+{
+    font_height fh;
+    font->GetHeight(&fh);
+    return std::max(kIcon + 4, ceilf(fh.ascent + fh.descent + fh.leading) + 6);
+}
+
+/* The texts of one row (or the header), each cut to its column. */
+static void
+draw_texts(BView *view, BRect row, const std::vector<std::string> &texts, const std::vector<float> &edges, BBitmap *icon,
+           bool with_icon_room)
+{
+    font_height fh;
+    view->GetFontHeight(&fh);
+    const float baseline = floorf(row.top + ((row.Height() + fh.ascent - fh.descent) / 2));
+
+    for (size_t i = 0; (i < texts.size()) && (i + 1 < edges.size()); i++) {
+        float x = edges[i] + 4;
+        if ((i == 0) && with_icon_room) {
+            draw_icon(view, icon, x, row);
+            x += kIcon + 4;
+        }
+        BString text(texts[i].c_str());
+        view->TruncateString(&text, B_TRUNCATE_END, edges[i + 1] - x - 4);
+        view->DrawString(text.String(), BPoint(x, baseline));
+    }
+}
+
+SettingsColumnItem::SettingsColumnItem(const std::vector<float> &f)
+    : fractions(f)
+    , texts(f.size())
+    , icon(nullptr)
+{
+}
+
+void
+SettingsColumnItem::SetText(size_t column, const std::string &text)
+{
+    if (column < texts.size())
+        texts[column] = text;
+}
+
+void
+SettingsColumnItem::DrawItem(BView *owner, BRect frame, bool)
+{
+    owner->SetLowColor(ui_color(IsSelected() ? B_LIST_SELECTED_BACKGROUND_COLOR : B_LIST_BACKGROUND_COLOR));
+    owner->FillRect(frame, B_SOLID_LOW);
+    owner->SetHighColor(ui_color(IsSelected() ? B_LIST_SELECTED_ITEM_TEXT_COLOR : B_LIST_ITEM_TEXT_COLOR));
+    draw_texts(owner, frame, texts, column_edges(fractions, frame.left, frame.Width()), icon, true);
+}
+
+void
+SettingsColumnItem::Update(BView *owner, const BFont *font)
+{
+    BListItem::Update(owner, font);
+    SetHeight(row_height(font));
+}
+
+namespace {
+
+/* The titles above a column list, lined up with its columns. */
+class ColumnTitles : public BView {
+public:
+    ColumnTitles(const std::vector<const char *> &t, const std::vector<float> &f)
+        : BView("titles", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE)
+        , fractions(f)
+    {
+        for (const char *title : t)
+            titles.push_back(title);
+        SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+        font_height fh;
+        be_plain_font->GetHeight(&fh);
+        const float height = ceilf(fh.ascent + fh.descent + fh.leading) + 6;
+        SetExplicitMinSize(BSize(B_SIZE_UNSET, height));
+        SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, height));
+    }
+
+    void Draw(BRect) override
+    {
+        const BRect bounds = Bounds();
+        SetLowUIColor(B_PANEL_BACKGROUND_COLOR);
+        SetHighUIColor(B_PANEL_TEXT_COLOR);
+        /* The list sits in a scroll view: a border, and the scroll bar. The
+           first title starts where the rows' icons do, as in Qt. */
+        const std::vector<float> edges = column_edges(fractions, 1, bounds.Width() - B_V_SCROLL_BAR_WIDTH - 2);
+        draw_texts(this, bounds, titles, edges, nullptr, false);
+        SetHighUIColor(B_PANEL_BACKGROUND_COLOR, B_DARKEN_2_TINT);
+        for (size_t i = 1; i + 1 < edges.size(); i++)
+            StrokeLine(BPoint(edges[i], bounds.top + 3), BPoint(edges[i], bounds.bottom - 3));
+        StrokeLine(BPoint(bounds.left, bounds.bottom), BPoint(bounds.right, bounds.bottom));
+    }
+
+private:
+    std::vector<std::string> titles;
+    std::vector<float>       fractions;
+};
+
+/* A tab drawing an icon in the room left by spaces before its label. */
+class IconTab : public BTab {
+public:
+    IconTab(BView *view, BBitmap *bitmap)
+        : BTab(view)
+        , icon(bitmap)
+    {
+    }
+
+    void DrawLabel(BView *owner, BRect frame) override
+    {
+        BTab::DrawLabel(owner, frame);
+        if (Label() == nullptr)
+            return;
+        /* BTab centres the label: the icon goes where the spaces are. */
+        const float width = owner->StringWidth(Label());
+        draw_icon(owner, icon, floorf(frame.left + ((frame.Width() - width) / 2)), frame);
+    }
+
+private:
+    BBitmap *icon;
+};
+
+} /* namespace */
+
+BView *
+settings_column_list(const char *name, BListView *list, const std::vector<const char *> &titles,
+                     const std::vector<float> &fractions)
+{
+    BView *holder = new BView(name, 0);
+    BLayoutBuilder::Group<>(holder, B_VERTICAL, 0)
+        .Add(new ColumnTitles(titles, fractions))
+        .Add(new BScrollView((std::string(name) + "_scroll").c_str(), list, 0, false, true), 1);
+    return holder;
+}
+
+SettingsIconItem::SettingsIconItem(const char *t, BBitmap *bitmap)
+    : text(t)
+    , icon(bitmap)
+{
+}
+
+void
+SettingsIconItem::DrawItem(BView *owner, BRect frame, bool)
+{
+    owner->SetLowColor(ui_color(IsSelected() ? B_LIST_SELECTED_BACKGROUND_COLOR : B_LIST_BACKGROUND_COLOR));
+    owner->FillRect(frame, B_SOLID_LOW);
+    owner->SetHighColor(ui_color(IsSelected() ? B_LIST_SELECTED_ITEM_TEXT_COLOR : B_LIST_ITEM_TEXT_COLOR));
+    draw_texts(owner, frame, { text }, { frame.left, frame.right }, icon, true);
+}
+
+void
+SettingsIconItem::Update(BView *owner, const BFont *font)
+{
+    BListItem::Update(owner, font);
+    SetHeight(row_height(font));
+}
+
+BTab *
+settings_icon_tab(BView *view, BBitmap *icon)
+{
+    /* Spaces before the name make the tab wide enough for the icon. */
+    std::string label;
+    while (be_plain_font->StringWidth(label.c_str()) < kIcon + 4)
+        label += ' ';
+    label += view->Name();
+
+    IconTab *tab = new IconTab(view, icon);
+    tab->SetLabel(label.c_str());
+    return tab;
 }

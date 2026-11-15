@@ -33,4 +33,13 @@ class BBitmap;
    kept; nullptr if there is no such icon. Any thread. */
 BBitmap *haiku_icon(const char *name);
 
+/* `base` with `overlay` drawn over it, Qt's getIconWithIndicator() (the
+   indicators are icons too: new, browse, eject, write_protected...); kept
+   like haiku_icon(). With overlay2, that one goes on top as well (Qt's
+   WriteProtectedBrowse). nullptr if `base` is missing. Any thread. */
+BBitmap *haiku_icon_with(const char *base, const char *overlay, const char *overlay2 = nullptr);
+
+/* A faded copy of an icon (for disabled menu items), kept. Any thread. */
+BBitmap *haiku_icon_disabled(BBitmap *icon);
+
 #endif

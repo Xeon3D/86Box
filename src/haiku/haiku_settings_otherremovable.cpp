@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <string>
 
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 #include "haiku_settings_drives.hpp"
 
@@ -231,6 +232,41 @@ next_free_tape_channel(const BusTracking *sbt, int bus)
     }
 }
 
+/* Qt's rdiskIconForType(). */
+static BBitmap *
+rdisk_icon(int type)
+{
+    switch (type) {
+        case RDISK_TYPE_ZIP_100:
+        case RDISK_TYPE_ZIP_100_PLUS:
+        case RDISK_TYPE_ZIP_250:
+        case RDISK_TYPE_ZIP_750:
+            return haiku_icon("zip");
+        case RDISK_TYPE_JAZ_1GB:
+        case RDISK_TYPE_JAZ_2GB:
+            return haiku_icon("jaz");
+        case RDISK_TYPE_SYJET_1_5GB:
+        case RDISK_TYPE_SYJET_S:
+        case RDISK_TYPE_SPARQ_1GB:
+        case RDISK_TYPE_SQ5200C:
+        case RDISK_TYPE_SQ3105S:
+        case RDISK_TYPE_EZ230S:
+        case RDISK_TYPE_EZ135A:
+        case RDISK_TYPE_EZ230A:
+        case RDISK_TYPE_SQ3105A:
+        case RDISK_TYPE_SQ3270A:
+        case RDISK_TYPE_EZ135S:
+        case RDISK_TYPE_SQ3270S:
+        case RDISK_TYPE_SQ5110C:
+        case RDISK_TYPE_SQ555:
+            return haiku_icon("syquest");
+        default:
+            return haiku_icon("rdisk");
+    }
+}
+
+static const std::vector<float> removable_columns = { 0.40f, 0.60f };
+
 class OtherRemovablePage : public SettingsPage {
 public:
     OtherRemovablePage()
@@ -269,7 +305,7 @@ public:
             mo_type->Add(mo_type_name(i).c_str(), i);
         for (int i = 0; i < MO_NUM; i++) {
             mo[i] = { mo_drives[i].bus_type, mo_drives[i].res, mo_drives[i].type };
-            mo_list->AddItem(new BStringItem(MoRowText(i).c_str()));
+            mo_list->AddItem(new SettingsColumnItem(removable_columns));
         }
         mo_list->Select(0);
         MoRowChanged();
@@ -285,7 +321,7 @@ public:
             rd_type->Add(rdisk_type_name(i).c_str(), i);
         for (int i = 0; i < RDISK_NUM; i++) {
             rd[i] = { rdisk_drives[i].bus_type, rdisk_list_channel(&rdisk_drives[i]), rdisk_drives[i].type };
-            rd_list->AddItem(new BStringItem(RDiskRowText(i).c_str()));
+            rd_list->AddItem(new SettingsColumnItem(removable_columns));
         }
         rd_list->Select(0);
         RDiskRowChanged();
@@ -300,10 +336,11 @@ public:
             tp_type->Add(tape_type_name(i).c_str(), i);
         for (int i = 0; i < TAPE_NUM; i++) {
             tp[i] = { tape_drives[i].bus_type, tape_drives[i].res, tape_drives[i].type };
-            tp_list->AddItem(new BStringItem(TapeRowText(i).c_str()));
+            tp_list->AddItem(new SettingsColumnItem(removable_columns));
         }
         tp_list->Select(0);
         TapeRowChanged();
+        UpdateRows();
     }
 
     ~OtherRemovablePage() override
@@ -462,20 +499,21 @@ private:
         uint32 type;
     };
 
+    /* qt_settingsotherremovable.ui: the list (Bus | Type), then a grid:
+         Bus: [bus]  Channel: [channel]
+         Type: [type..................]   */
     static BView *MakeTab(const char *name, const char *scroll_name, BListView *list, Choice *bus, Choice *channel, Choice *type)
     {
         BView *tab = new BView(name, 0);
         BLayoutBuilder::Group<>(tab, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
-            .Add(new BScrollView(scroll_name, list, 0, false, true), 1)
-            .AddGroup(B_HORIZONTAL)
-                .Add(bus->field)
-                .Add(channel->field)
-                .AddGlue()
-            .End()
-            .AddGroup(B_HORIZONTAL)
-                .Add(type->field)
-                .AddGlue()
+            .Add(settings_column_list(scroll_name, list, { "Bus", "Type" }, removable_columns), 1)
+            .AddGrid()
+                .AddMenuField(bus->field, 0, 0)
+                .AddMenuField(channel->field, 2, 0)
+                .AddMenuField(type->field, 0, 1, B_ALIGN_HORIZONTAL_UNSET, 1, 3)
+                .SetColumnWeight(1, 1.0f)
+                .SetColumnWeight(3, 1.0f)
             .End();
         return tab;
     }
@@ -486,28 +524,14 @@ private:
         return (r < 0) ? 0 : r;
     }
 
-    std::string MoRowText(int i) const
+    /* A row as Qt fills it: the bus and channel with the drive's icon
+       (Qt's setMOBus / setRDiskBus / setTapeBus), then the type. */
+    static void SetRow(BListView *list, int i, BBitmap *icon, const std::string &bus, const std::string &type)
     {
-        return std::to_string(i + 1) + ": " + drives_bus_channel_name(mo[i].bus, mo[i].channel) + ", " +
-            ((mo[i].bus == MO_BUS_DISABLED) ? std::string("None") : mo_type_name(mo[i].type));
-    }
-
-    std::string RDiskRowText(int i) const
-    {
-        return std::to_string(i + 1) + ": " + rdisk_channel_name(rd[i].bus, rd[i].type, rd[i].channel) + ", " +
-            ((rd[i].bus == RDISK_BUS_DISABLED) ? std::string("None") : rdisk_type_name(rd[i].type));
-    }
-
-    std::string TapeRowText(int i) const
-    {
-        return std::to_string(i + 1) + ": " + drives_bus_channel_name(tp[i].bus, tp[i].channel) + ", " +
-            ((tp[i].bus == TAPE_BUS_DISABLED) ? std::string("None") : tape_type_name(tp[i].type));
-    }
-
-    static void SetRowText(BListView *list, int i, const std::string &text)
-    {
-        if (BStringItem *item = dynamic_cast<BStringItem *>(list->ItemAt(i))) {
-            item->SetText(text.c_str());
+        if (SettingsColumnItem *item = dynamic_cast<SettingsColumnItem *>(list->ItemAt(i))) {
+            item->SetIcon(icon);
+            item->SetText(0, bus);
+            item->SetText(1, type);
             list->InvalidateItem(i);
         }
     }
@@ -515,11 +539,17 @@ private:
     void UpdateRows()
     {
         for (int i = 0; i < MO_NUM; i++)
-            SetRowText(mo_list, i, MoRowText(i));
+            SetRow(mo_list, i, haiku_icon((mo[i].bus == MO_BUS_DISABLED) ? "mo_disabled" : "mo"),
+                   drives_bus_channel_name(mo[i].bus, mo[i].channel),
+                   (mo[i].bus == MO_BUS_DISABLED) ? std::string("None") : mo_type_name(mo[i].type));
         for (int i = 0; i < RDISK_NUM; i++)
-            SetRowText(rd_list, i, RDiskRowText(i));
+            SetRow(rd_list, i, (rd[i].bus == RDISK_BUS_DISABLED) ? haiku_icon("rdisk_disabled") : rdisk_icon(rd[i].type),
+                   rdisk_channel_name(rd[i].bus, rd[i].type, rd[i].channel),
+                   (rd[i].bus == RDISK_BUS_DISABLED) ? std::string("None") : rdisk_type_name(rd[i].type));
         for (int i = 0; i < TAPE_NUM; i++)
-            SetRowText(tp_list, i, TapeRowText(i));
+            SetRow(tp_list, i, haiku_icon((tp[i].bus == TAPE_BUS_DISABLED) ? "tape_disabled" : "tape"),
+                   drives_bus_channel_name(tp[i].bus, tp[i].channel),
+                   (tp[i].bus == TAPE_BUS_DISABLED) ? std::string("None") : tape_type_name(tp[i].type));
     }
 
     /* updateRDiskTypeCombo() / updateTapeTypeCombo(): the types that do not

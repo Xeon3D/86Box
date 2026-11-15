@@ -31,7 +31,13 @@
 #include <ListView.h>
 #include <ScrollView.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+
 #include "haiku_frontend.hpp"
+#include "haiku_icons.hpp"
 #include "haiku_settings.hpp"
 #include "haiku_settings_common.hpp"
 
@@ -47,6 +53,83 @@ enum : uint32 {
     MSG_PAGE_SELECTED = 'swpg',
     MSG_OK            = 'swok',
     MSG_CANCEL        = 'swcn',
+};
+
+/* Qt's settingsPages: each page's icon (an .ico of the Qt UI). */
+static const struct {
+    const char *name;
+    const char *icon;
+} page_icons[] = {
+    { "Machine", "machine" },
+    { "Display", "display" },
+    { "Input devices", "input_devices" },
+    { "Sound", "sound" },
+    { "Network", "network" },
+    { "Ports (COM & LPT)", "ports" },
+    { "Storage controllers", "storage_controllers" },
+    { "Hard disks", "hard_disk" },
+    { "Floppy & CD-ROM drives", "floppy_and_cdrom_drives" },
+    { "Other removable devices", "other_removable_devices" },
+    { "Other peripherals", "other_peripherals" },
+};
+
+static BBitmap *
+page_icon(const char *name)
+{
+    for (const auto &page : page_icons) {
+        if (strcmp(page.name, name) == 0)
+            return haiku_icon(page.icon);
+    }
+    return nullptr;
+}
+
+/* The title above the page: its icon and name in bold, then a line (Qt's
+   headerIcon, headerLabel and headerLine in qt_pageddialog.ui). */
+class PageHeader : public BView {
+public:
+    PageHeader()
+        : BView("page_header", B_WILL_DRAW | B_FULL_UPDATE_ON_RESIZE)
+        , icon(nullptr)
+    {
+        SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
+        SetFont(be_bold_font);
+        font_height fh;
+        be_bold_font->GetHeight(&fh);
+        const float height = std::max(16.0f, ceilf(fh.ascent + fh.descent)) + 10;
+        SetExplicitMinSize(BSize(B_SIZE_UNSET, height));
+        SetExplicitMaxSize(BSize(B_SIZE_UNLIMITED, height));
+    }
+
+    void Set(const char *name, BBitmap *bitmap)
+    {
+        title = name;
+        icon  = bitmap;
+        Invalidate();
+    }
+
+    void Draw(BRect) override
+    {
+        const BRect bounds = Bounds();
+        const float row    = bounds.bottom - 3; /* above the line */
+        if (icon != nullptr) {
+            SetDrawingMode(B_OP_ALPHA);
+            SetBlendingMode(B_PIXEL_ALPHA, B_ALPHA_OVERLAY);
+            DrawBitmap(icon, BPoint(4, floorf((row - 16) / 2)));
+            SetDrawingMode(B_OP_COPY);
+        }
+        font_height fh;
+        GetFontHeight(&fh);
+        SetHighUIColor(B_PANEL_TEXT_COLOR);
+        DrawString(title.c_str(), BPoint(26, floorf((row + fh.ascent - fh.descent) / 2)));
+        SetHighUIColor(B_PANEL_BACKGROUND_COLOR, B_DARKEN_2_TINT);
+        StrokeLine(BPoint(bounds.left, bounds.bottom - 1), BPoint(bounds.right, bounds.bottom - 1));
+        SetHighUIColor(B_PANEL_BACKGROUND_COLOR, B_LIGHTEN_2_TINT);
+        StrokeLine(BPoint(bounds.left, bounds.bottom), BPoint(bounds.right, bounds.bottom));
+    }
+
+private:
+    std::string title;
+    BBitmap    *icon;
 };
 
 SettingsWindow::SettingsWindow(BWindow *owner)
@@ -92,9 +175,10 @@ SettingsWindow::SettingsWindow(BWindow *owner)
     BView *cards_holder = new BView("cards", 0, cards);
     cards_holder->SetViewUIColor(B_PANEL_BACKGROUND_COLOR);
     for (SettingsPage *page : pages) {
-        page_list->AddItem(new BStringItem(page->Name()));
+        page_list->AddItem(new SettingsIconItem(page->Name(), page_icon(page->Name())));
         cards->AddView(page);
     }
+    header = new PageHeader();
 
     BButton *ok     = new BButton("ok", "OK", new BMessage(MSG_OK));
     BButton *cancel = new BButton("cancel", "Cancel", new BMessage(MSG_CANCEL));
@@ -103,7 +187,10 @@ SettingsWindow::SettingsWindow(BWindow *owner)
         .SetInsets(B_USE_WINDOW_SPACING)
         .AddGroup(B_HORIZONTAL)
             .Add(list_scroll)
-            .Add(cards_holder, 1)
+            .AddGroup(B_VERTICAL, 0, 1)
+                .Add(header)
+                .Add(cards_holder, 1)
+            .End()
         .End()
         .AddGroup(B_HORIZONTAL)
             .AddGlue()
@@ -147,8 +234,10 @@ SettingsWindow::MessageReceived(BMessage *message)
                     break;
                 }
                 const int32 index = page_list->CurrentSelection();
-                if (index >= 0)
+                if (index >= 0) {
                     cards->SetVisibleItem(index);
+                    header->Set(pages[index]->Name(), page_icon(pages[index]->Name()));
+                }
                 break;
             }
         case MSG_OK:

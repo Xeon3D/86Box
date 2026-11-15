@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <string>
 
+#include "haiku_icons.hpp"
 #include "haiku_settings_common.hpp"
 #include "haiku_settings_drives.hpp"
 
@@ -131,6 +132,38 @@ cdrom_type_on_bus(int j, int bus)
           (bus != CDROM_BUS_CM100) && (bus != CDROM_BUS_SONY)));
 }
 
+/* The row icons of Qt's setFloppyType() and setCDROMBus(). */
+static BBitmap *
+floppy_icon(int type)
+{
+    if (type == 0)
+        return haiku_icon("floppy_disabled");
+    return haiku_icon(((type >= 1) && (type <= 6)) ? "floppy_525" : "floppy_35");
+}
+
+static BBitmap *
+cdrom_icon(int bus, int type)
+{
+    if (bus == CDROM_BUS_DISABLED)
+        return haiku_icon("cdrom_disabled");
+    if (cdrom_is_bd(type))
+        return haiku_icon("bdrom");
+    if (cdrom_is_hd_dvd(type))
+        return haiku_icon("hd_dvdrom");
+    if (cdrom_is_dvd(type))
+        return haiku_icon("dvdrom");
+    if (cdrom_is_cdrw(type))
+        return haiku_icon("cdrw");
+    if (cdrom_is_cdr(type))
+        return haiku_icon("cdr");
+    return haiku_icon("cdrom");
+}
+
+/* Qt's tree views size their columns to the contents; these shares come
+   close for the usual names. */
+static const std::vector<float> floppy_columns = { 0.60f, 0.20f, 0.20f };
+static const std::vector<float> cdrom_columns  = { 0.30f, 0.14f, 0.56f };
+
 class FloppyCdromPage : public SettingsPage {
 public:
     FloppyCdromPage()
@@ -155,30 +188,37 @@ public:
         cd_unlimited = new BCheckBox("cd_unlimited", "Unlimited capacity", new BMessage(MSG_CD_UNLIMITED));
         cd_ecc       = new BCheckBox("cd_ecc", "Use EDC/ECC emulation", new BMessage(MSG_CD_ECC));
 
+        /* qt_settingsfloppycdrom.ui: the list (Type | Turbo | Check BPB),
+           then a grid: Type: [type] [Turbo timings] [Check BPB]
+                        Audio: [audio............................] */
         BView *fd_tab = new BView("Floppy drives", 0);
         BLayoutBuilder::Group<>(fd_tab, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
-            .Add(new BScrollView("floppy_scroll", fd_list, 0, false, true), 1)
-            .AddGroup(B_HORIZONTAL)
-                .Add(fd_type->field)
-                .Add(fd_turbo)
-                .Add(fd_bpb)
-                .Add(fd_audio->field)
-                .AddGlue()
+            .Add(settings_column_list("floppy_list", fd_list, { "Type", "Turbo", "Check BPB" }, floppy_columns), 1)
+            .AddGrid()
+                .AddMenuField(fd_type->field, 0, 0)
+                .Add(fd_turbo, 2, 0)
+                .Add(fd_bpb, 3, 0)
+                .AddMenuField(fd_audio->field, 0, 1, B_ALIGN_HORIZONTAL_UNSET, 1, 3)
+                .SetColumnWeight(1, 1.0f)
             .End();
 
+        /* The list (Bus | Speed | Type), then a grid:
+             Bus: [bus]  Channel: [channel]  [Unlimited capacity]
+             Type: [type.................]  [Use EDC/ECC emulation]
+             CD speed: [ ]  DVD speed: [ ]  HD/BD speed: [ ]           */
         BView *cd_tab = new BView("CD-ROM drives", 0);
         BLayoutBuilder::Group<>(cd_tab, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
-            .Add(new BScrollView("cdrom_scroll", cd_list, 0, false, true), 1)
-            .AddGroup(B_HORIZONTAL)
-                .Add(cd_bus->field)
-                .Add(cd_channel->field)
-                .Add(cd_unlimited)
-            .End()
-            .AddGroup(B_HORIZONTAL)
-                .Add(cd_type->field)
-                .Add(cd_ecc)
+            .Add(settings_column_list("cdrom_list", cd_list, { "Bus", "Speed", "Type" }, cdrom_columns), 1)
+            .AddGrid()
+                .AddMenuField(cd_bus->field, 0, 0)
+                .AddMenuField(cd_channel->field, 2, 0)
+                .Add(cd_unlimited, 4, 0, 2)
+                .AddMenuField(cd_type->field, 0, 1, B_ALIGN_HORIZONTAL_UNSET, 1, 3)
+                .Add(cd_ecc, 4, 1, 2)
+                .SetColumnWeight(1, 1.0f)
+                .SetColumnWeight(3, 1.0f)
             .End()
             .AddGroup(B_HORIZONTAL)
                 .Add(cd_speed->field)
@@ -188,8 +228,8 @@ public:
             .End();
 
         BTabView *tabs = new BTabView("tabs", B_WIDTH_FROM_LABEL);
-        tabs->AddTab(fd_tab);
-        tabs->AddTab(cd_tab);
+        tabs->AddTab(fd_tab, settings_icon_tab(fd_tab, haiku_icon("floppy_tab")));
+        tabs->AddTab(cd_tab, settings_icon_tab(cd_tab, haiku_icon("cdrom")));
         BLayoutBuilder::Group<>(this, B_VERTICAL)
             .SetInsets(B_USE_DEFAULT_SPACING)
             .Add(tabs);
@@ -250,7 +290,8 @@ public:
             cd[i].hd_speed   = cdrom[i].hd_speed;
             cd[i].restricted = cdrom[i].restricted_capacity;
             cd[i].no_check   = cdrom[i].no_check;
-            cd_list->AddItem(new BStringItem(CdromRowText(i).c_str()));
+            cd_list->AddItem(new SettingsColumnItem(cdrom_columns));
+            UpdateCdromRow(i);
         }
 
         MachineChanged(CurrentMachine());
@@ -283,8 +324,10 @@ public:
         int32       selected = fixed ? 0 : fd_list->CurrentSelection();
         while (BListItem *item = fd_list->RemoveItem((int32) 0))
             delete item;
-        for (int i = 0; i < rows; i++)
-            fd_list->AddItem(new BStringItem(FloppyRowText(i).c_str()));
+        for (int i = 0; i < rows; i++) {
+            fd_list->AddItem(new SettingsColumnItem(floppy_columns));
+            UpdateFloppyRow(i);
+        }
         if ((selected < 0) || (selected >= rows))
             selected = 0;
         fd_list->Select(selected);
@@ -466,37 +509,32 @@ private:
         return (r < 0) ? 0 : r;
     }
 
-    std::string FloppyRowText(int i) const
-    {
-        char temp[512];
-        snprintf(temp, sizeof(temp), "%i: %s, turbo %s, check BPB %s", i + 1, fdd_getname(fd[i].type),
-                 fd[i].turbo ? "on" : "off", fd[i].bpb ? "on" : "off");
-        return temp;
-    }
-
-    std::string CdromRowText(int i) const
-    {
-        std::string text = std::to_string(i + 1) + ": " + cdrom_channel_name(cd[i].bus, cd[i].channel);
-        text += ", " + ((cd[i].speed > 72) ? std::string("Turbo") : (std::to_string(cd[i].speed) + "x"));
-        if (cd[i].bus == CDROM_BUS_DISABLED)
-            text += ", None";
-        else if (cd[i].bus != CDROM_BUS_MITSUMI)
-            text += ", " + cdrom_name(cd[i].type);
-        return text;
-    }
-
+    /* A floppy row as Qt fills it: the type with its icon, Turbo, Check BPB. */
     void UpdateFloppyRow(int i)
     {
-        if (BStringItem *item = dynamic_cast<BStringItem *>(fd_list->ItemAt(i))) {
-            item->SetText(FloppyRowText(i).c_str());
+        if (SettingsColumnItem *item = dynamic_cast<SettingsColumnItem *>(fd_list->ItemAt(i))) {
+            item->SetIcon(floppy_icon(fd[i].type));
+            item->SetText(0, fdd_getname(fd[i].type));
+            item->SetText(1, fd[i].turbo ? "On" : "Off");
+            item->SetText(2, fd[i].bpb ? "On" : "Off");
             fd_list->InvalidateItem(i);
         }
     }
 
+    /* A CD-ROM row: the bus and channel with the drive's icon, the speed,
+       the type (none shown for Mitsumi, as in Qt). */
     void UpdateCdromRow(int i)
     {
-        if (BStringItem *item = dynamic_cast<BStringItem *>(cd_list->ItemAt(i))) {
-            item->SetText(CdromRowText(i).c_str());
+        if (SettingsColumnItem *item = dynamic_cast<SettingsColumnItem *>(cd_list->ItemAt(i))) {
+            item->SetIcon(cdrom_icon(cd[i].bus, cd[i].type));
+            item->SetText(0, cdrom_channel_name(cd[i].bus, cd[i].channel));
+            item->SetText(1, (cd[i].speed > 72) ? std::string("Turbo") : (std::to_string(cd[i].speed) + "x"));
+            if (cd[i].bus == CDROM_BUS_DISABLED)
+                item->SetText(2, "None");
+            else if (cd[i].bus != CDROM_BUS_MITSUMI)
+                item->SetText(2, cdrom_name(cd[i].type));
+            else
+                item->SetText(2, "");
             cd_list->InvalidateItem(i);
         }
     }

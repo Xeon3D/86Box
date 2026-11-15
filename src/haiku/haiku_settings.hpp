@@ -22,6 +22,7 @@
 
 class BCardLayout;
 class BListView;
+class PageHeader;
 class SettingsPage;
 
 class SettingsWindow : public BWindow {
@@ -44,6 +45,7 @@ private:
     BWindow                    *owner;
     BListView                  *page_list;
     BCardLayout                *cards;
+    PageHeader                 *header;
     std::vector<SettingsPage *> pages;
     bool                        finished;
 };
